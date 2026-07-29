@@ -14,6 +14,9 @@
 | 第一 | 核心模組 + VPS 部署 + 驗收 | ✅ 上線（見本節） |
 | 第二 | 餘額告警排程 | ✅ 上線，每日 08:00（見 §5） |
 | 第三 | Web 發送介面 | ✅ 上線 <https://sms.chenghyang.uk>（見 §6） |
+| 追加 | 投遞狀態查詢 | ✅ 上線，`GET /status?msgid=<id>`，唯讀免費（見 §6.4） |
+
+> 生產 commit：**`50a0fc0`**（2026-07-29 Session 4）。VPS 的 `mitake.py` 與 web 服務都在此版。
 
 | 項目 | 值 |
 | ------ | ----- |
@@ -198,21 +201,53 @@ sudo systemctl restart cloudflared      # 不支援 reload
 
 ⚠️ **改共用設定檔前先量 baseline**（2026-07-29 的疏失）：當時沒先記錄既有 hostname 的狀態碼，事後看到 `prompts` 404、`mcp` 502 只能從「錯誤碼性質」推論不是自己造成的。推論成立，但先量就是直接比對。
 
-### 6.5 🔴 投遞狀態查詢：已寫完但**未經 QA/reviewer**（下個 session 第一件事）
+### 6.4 投遞狀態查詢 ✅ 已完成上線（2026-07-29 Session 4）
 
-commit `e6b3523` 新增了「查詢簡訊投遞狀態」功能，**程式碼在版控裡但尚未部署**，生產環境仍是 `cba2d45`。
+commit `e6b3523` 寫完但跳過 QA/reviewer，Session 4 補跑完整三 agent 流程並修掉一項 MUST_FIX，
+現已部署（生產 commit `50a0fc0`）。
 
-| 已驗證 | 未驗證 |
+| 項目 | 值 |
 | ------ | ------ |
-| **179 passed**（既有 79 零回歸 + 新增 100） | ❌ code-qa 的 20+ case 獨立驗證 |
-| ruff 全綠、語法通過 | ❌ code-reviewer 的 adversarial review |
-| `mitake.py` **0 deletions**（既有函式一行未動） | ❌ 突變測試（新測試鎖不鎖得住） |
-| 零外部依賴 | ❌ VPS 真實環境驗證 |
-| 狀態碼對照表逐碼實測正確 | |
+| 端點 | `GET /status?msgid=<id>`（唯讀免費，走 SmQuery 不扣點） |
+| 模組介面 | `query_message_status(msgid, *, timeout=25.0) -> dict`；狀態碼對照見 `mitake.DELIVERY_STATUS_TABLE` |
+| 回應格式 | Tab 分隔的 `msgid \t statuscode \t yyyyMMddHHmmss`（與查餘額的 `AccountPoint=` 格式完全不同，故不重用 `parse_response`） |
+| 測試 | **230 passed**、ruff 全綠、12/12 突變測試全數鎖住 |
+| 真實驗收 | 2026-07-29 VPS 實查 msgid `0315772761` / `0315794968` → 皆 `code='4'` 已送達手機；同時 `query_balance()` 仍解出 12568（確認零回歸、查詢不扣點） |
 
-> ⚠️ commit `e6b3523` 的 message 誤寫「146 passed」—— 那是我在 writer 尚未寫完
-> `test_web.py` 時測到的中間數字。實際最終為 **179 passed**（writer Manifest 與事後
-> 複測皆為此數）。commit 已 push 故不 amend，以本表為準。
+#### 🔴 Session 4 修掉的 MUST_FIX：msgid 身分不符會顯示**別則簡訊**的狀態
+
+原實作遇到三竹回的 msgid 與查詢的不符時只 `logger.warning` 就放行。reviewer 用假回應實測：
+查 `0315772761`、三竹回 `9999999999\t4\t...` → 整頁是綠色「已送達手機」，而**使用者問的 msgid
+一個字都沒出現**。他不會去看 journald 那行 WARNING，他會停止追查。反向亦然：多行回應時畫面
+可能說「沒送達，可以重新發送」而那則其實已送達 → **多扣 1 點 + 對方收到兩封**。
+
+成因是兩個各自合理的決定疊起來：解析層寫死「取第一個非空行」（`parse_status_response`），
+呼叫端沒有任何一處斷言「那一筆就是你問的那筆」。
+
+**現行行為**：不符即丟 `MitakeAPIError`（`kind=msgid_mismatch`、`possibly_charged=False`），
+訊息同時帶查詢與回傳兩個 msgid，畫面走「查詢無效」不可重試頁。
+
+⚠️ **「拒絕猜測」現在是模組層明文規則** —— 格式異常拋錯、身分不符也拋錯。改這裡之前先讀
+`mitake.py` 該區段開頭的規則註解。放寬任何一半都會回到上面那條路。
+
+#### 同輪一併修掉的三項
+
+| 修正 | 為什麼 |
+| ------ | ------ |
+| `_fetch_raw` 加 `MAX_RESPONSE_BYTES = 64 KiB` | 實測 20 萬字元回應會產生 202,751 bytes 錯誤頁。**超限拒絕而非截斷解析** —— 三竹正常回應數十位元組，超過代表拿到的不是預期內容（代理器 HTML、DNS 劫持），截斷後解出的任何狀態都是憑空捏造 |
+| `_read_capped()` 用**迴圈**而非單次 `read(limit)` | `read(n)` 契約是「最多 n 個位元組」，允許短讀。單次寫法遇短讀會把 `AccountPoint=12571` 靜默截成 `AccountPoi`，讓 job_010 發出一則**不存在的低點數警報** |
+| `describe_delivery_status` / `classify_statuscode` 查表前正規化大小寫 | 大寫 `K` 原本落到 `unknown`「無法辨識的狀態碼」而非 `ip_blocked`「IP 不在白名單」，把純設定問題誤導成「這則簡訊狀態不明」。回傳值仍保留原始 statuscode |
+
+> reviewer 實測推翻了一項疑慮：正規化「擴大已知碼接受面」（`' 4 '` 帶空白也被接受）的代價
+> **在真實路徑上不存在** —— 兩條解析路徑在查表前早已 strip（`mitake.py:1074` 與 `:404`，
+> 皆為既有程式碼）。`_normalize_statuscode` 的 `.strip()` 實質是死碼。
+
+#### 下游影響已實測確認為零
+
+reviewer 實讀 `n8n2vps-hub/jobs/job_010_mitake_balance/handler.py` 的
+gate `ACTIONABLE_API_KINDS = ("ip_blocked", "auth_failed", "api")`，HEAD/新版雙載入跑 7 種回應
+A/B：新 kind `bad_response` 唯一能到 job_010 的入口是 64 KiB 上限，而**同一份輸入在舊版是
+`network`，兩者都不在 gate 內** → 告警行為逐格相同，沒有「冒出沒見過的 kind 導致漏報」。
 
 **writer 自主做的幾個判斷（接手時別當成疏漏改掉）**：
 
@@ -227,29 +262,42 @@ commit `e6b3523` 新增了「查詢簡訊投遞狀態」功能，**程式碼在�
 遇到**空 msgid** 的回應（`\t4\t2026...`）會吃掉前導 Tab、導致欄位整排左移而**靜默解出錯誤狀態**。
 已改為 `strip(" \n")`（不去 Tab）並留測試鎖住。這是它自己寫測試時發現的。
 
-缺 QA/reviewer 是 2026-07-29 session 收尾時間限制所致，**不是**判斷不需要。使用者當時已同意分級為 complex（20+ case + reviewer）。
+#### 🔴 最關鍵的正確性（改任何相關程式碼前先讀這條）
 
-**接手步驟**：
+**狀態碼 1/2/3 是「已送達業者」歸類為 pending，只有 `4` 是「已送達手機」才 `is_delivered=True`。**
+把前者講成後者會讓使用者以為對方收到了 —— 那是這整個功能存在的全部理由。
+`DELIVERED_STATUSCODE = "4"` 是唯一的 delivered 碼，已有突變測試鎖住。
 
-```
-1. 派 code-qa：20+ case。重點驗
-   - 1/2/3 歸類為 pending、只有 4 是 delivered（把前者講成後者是最貴的錯）
-   - 每個狀態碼逐碼對到正確中文與分類
-   - query_message_status 不扣點（endpoint 是 SmQuery 不是 SmSend）
-   - msgid 驗證、Big5 解碼、欄位不足/空回應等異常格式
-   - 成功頁真的有帶 msgid 的查詢連結
-   - 回歸：既有 79 條不可壞，mitake.py 既有行為零改動
-2. 派 code-reviewer：adversarial review
-3. 通過後才部署：VPS git pull + restart mitake-web（見 §6.2）
-```
-
-**功能規格**：`query_message_status(msgid, *, timeout=25.0) -> dict`，走 `SmQuery?...&msgid=<id>`（**唯讀免費不扣點**），回應是 Tab 分隔的 `msgid \t statuscode \t yyyyMMddHHmmss`。狀態碼對照見 `mitake.DELIVERY_STATUS_TABLE`。
-
-### 6.4 已知限制與待辦
+### 6.5 已知限制與待辦
 
 - **`possibly_charged` 只存在於 `MitakeAPIError`** —— Web 層已用 `getattr(..., True)` 保守處理，但 `MitakeError` 基底補一個 class-level `possibly_charged = False` 會更乾淨（見 §2.1）
 - 純 ASCII 內容的則數會**高估**（一律 70 字/則，三竹對純英數通常 160 字/則）。方向保守不會少扣，但確認頁的數字會偏多
 - 稽核檔目前無 logrotate。日後若加，注意速率回填是從稽核檔 tail 讀的，輪替當下該小時額度會重置
+
+#### Session 4 的 reviewer 列出、當時未做的（依優先序）
+
+1. 🟡 **`_preview_for_error` 覆蓋不對稱** —— 目前只套在 `parse_status_response` 兩處，
+   `_raise_if_failed` / `query_balance` 仍是裸 `{raw_text!r}`。reviewer 實測：一個 20 KiB 的
+   nginx 錯誤頁 → **20,053 字元**錯誤訊息，而 Telegram `sendMessage` 上限 4096
+   （API 文件事實，未實打驗證）。推論後果是**三管道告警靜默退化成只剩 email，而且沒人會發現**
+   （`n8n2vps-hub/core/notifier.py:56-60` 每管道各自 try/except 回 `False`，不 cascade
+   但也不吭聲）。**這是既有問題非 Session 4 引入**：>64 KiB 那類已從 409,640 字元降到 495，
+   但 20 KiB 那類新舊皆為 20,053。補法是把 `_preview_for_error` 套到 `mitake.py:784`、`:806`
+   與 `_raise_if_failed` 其餘兩處，約四行。
+   ⚠️ 動的是 job_010 每日 08:00 路徑，改動需完整跑一輪 writer/QA/reviewer。
+2. 🟢 **`kind=network` 語意可議** —— `query_balance` 拿到垃圾回應分類為 `network`，但新建的
+   `bad_response` 正是為此設計。reviewer 已驗兩者對 job_010 gate 皆為 False，改動安全但無
+   可觀察收益。建議與第 1 項同批做或同批不做，別單獨做。
+3. 🟢 **缺一支「真 mitake + 假 `_OPENER`」的兩層整合測試** —— 現有 web 層測試全是注入假例外，
+   鎖的是「Web 層拿到某 kind 會渲染什麼」，**沒鎖「mitake 真的會產出那個 kind」**。
+   Session 4 的 reviewer 人工補跑過（五情境全通過），但下次沒人補就沒人知道。
+4. 🟢 **msgid 比對大小寫精確、statuscode 大小寫不敏感** —— 同一模組兩種標準。
+   `_MSGID_PATTERN` 允許英文字母故機制上可達，但實測樣本的 msgid 是純數字，今天觸發不了。
+   **明確不建議放寬**（那會回到 §6.4 修掉的那條路），純粹記錄；三竹若改用英數 msgid，
+   這是第一個該回來看的地方。
+5. 【理論、未在真實部署觸發】上游若把請求 URL 回吐在錯誤頁，帳密會進到錯誤訊息並被渲染／寄出。
+   模組固定走 `https://smsapi.mitake.com.tw`，中間人看得到 query string 已等於 TLS 被攔截，
+   那是更大的問題。若做第 1 項，順手在 `_preview_for_error` 裡遮蔽帳密字串即可一併蓋掉。
 
 ---
 
@@ -275,7 +323,7 @@ commit `e6b3523` 新增了「查詢簡訊投遞狀態」功能，**程式碼在�
 
 ```
 - [ ] 讀本手冊 + README.md（特別是 §2.1 possibly_charged 與 §3 鐵律）
-- [ ] 本機跑 python mitake.py（離線冒煙）與 pytest tests/（應為 6 passed）
+- [ ] 本機跑 python mitake.py（離線冒煙）與 pytest tests/（應為 **230 passed**）
 - [ ] 寫新測試前先讀 tests/conftest.py 檔頭：它預設封鎖所有對三竹的呼叫，忘記攔截會紅燈
 - [ ] SSH VPS 跑一次 query_balance 確認環境仍通（見 §1 指令）
 - [ ] 第二部分動工前：先讀 n8n2vps-hub 的 CLAUDE.md（部署鐵律）與 jobs/job_009 範本
