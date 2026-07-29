@@ -60,7 +60,9 @@ LogsDirectoryMode=0750
 # 加了這行之後會變成一個一眼看得見的 403。壞掉會有人回報，安靜被利用不會。
 # 所以它取代不了第 3 步，只是第 3 步失手時的安全網 —— 兩者要一起做。
 #
-#Environment=MITAKE_WEB_REQUIRE_ACCESS_EMAIL=chenghyang2001@gmail.com
+# 2026-07-29 啟用（CF Access 已於同日設定完成：application=mitake-web、
+# policy=only-me、Allow + Emails=chenghyang2001@gmail.com、session 24h）。
+Environment=MITAKE_WEB_REQUIRE_ACCESS_EMAIL=chenghyang2001@gmail.com
 
 # 🔴 鐵律：一定要寫 /usr/bin/python3.12 的絕對路徑。
 # 走 /usr/bin/python3（symlink）在這台 VPS 上會被未知機制 SIGKILL，
