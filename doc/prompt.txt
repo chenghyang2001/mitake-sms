@@ -14,3 +14,25 @@ commit 完再收工
 - conftest 第三輪 2 項 🟡 → 都修
 - 若再有 🔴 → 直接修到過不用問
 - 收工範圍 → 完整收工
+
+## Session 3（2026-07-29）
+
+do 第二／三部分（餘額告警 job_010、Web 發送介面）now
+commit 完再收工 → keep going
+skip the real send, go to step 4
+open the web page to set up Zero Trust Dashboard on CF site
+here is my cf page and i am logged in now. you set up all now
+（貼 CF API token）
+enable the access email check too
+i send one sms message on https://sms.chenghyang.uk it shows succeed but i do not receive the sms message on my phone. fix it
+yes, add the delivery status lookup
+tell me what the current status now
+finish the writer then wrap up → wrap up now
+
+## 過程中的裁示
+- 兩部分一起做；job_010 憑證由 handler 自行解析 env 檔；餘額正常也每天通知
+- 分級：job_010 中等、Web 複雜、投遞狀態查詢複雜
+- redirect 🔴 修法選「禁止 redirect」；reviewer 的 🟡 多數採納
+- 逃生門只用 marker，不加環境變數第二把鎖
+- Web 上線：做到第 3 步 → 改為跳過真發 → 第 4 步用 API token 由 Claude 代設
+- 若 reviewer 再提 🔴 → 直接修到過不用問

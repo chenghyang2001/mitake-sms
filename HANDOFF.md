@@ -198,6 +198,36 @@ sudo systemctl restart cloudflared      # 不支援 reload
 
 ⚠️ **改共用設定檔前先量 baseline**（2026-07-29 的疏失）：當時沒先記錄既有 hostname 的狀態碼，事後看到 `prompts` 404、`mcp` 502 只能從「錯誤碼性質」推論不是自己造成的。推論成立，但先量就是直接比對。
 
+### 6.5 🔴 投遞狀態查詢：已寫完但**未經 QA/reviewer**（下個 session 第一件事）
+
+commit `e6b3523` 新增了「查詢簡訊投遞狀態」功能，**程式碼在版控裡但尚未部署**，生產環境仍是 `cba2d45`。
+
+| 已驗證 | 未驗證 |
+| ------ | ------ |
+| 146 passed（原 79 + 新增 67） | ❌ code-qa 的 20+ case 獨立驗證 |
+| ruff 全綠、語法通過 | ❌ code-reviewer 的 adversarial review |
+| `mitake.py` **0 deletions**（既有函式一行未動） | ❌ 突變測試（新測試鎖不鎖得住） |
+| 零外部依賴 | ❌ VPS 真實環境驗證 |
+| 狀態碼對照表逐碼實測正確 | |
+
+缺 QA/reviewer 是 2026-07-29 session 收尾時間限制所致，**不是**判斷不需要。使用者當時已同意分級為 complex（20+ case + reviewer）。
+
+**接手步驟**：
+
+```
+1. 派 code-qa：20+ case。重點驗
+   - 1/2/3 歸類為 pending、只有 4 是 delivered（把前者講成後者是最貴的錯）
+   - 每個狀態碼逐碼對到正確中文與分類
+   - query_message_status 不扣點（endpoint 是 SmQuery 不是 SmSend）
+   - msgid 驗證、Big5 解碼、欄位不足/空回應等異常格式
+   - 成功頁真的有帶 msgid 的查詢連結
+   - 回歸：既有 79 條不可壞，mitake.py 既有行為零改動
+2. 派 code-reviewer：adversarial review
+3. 通過後才部署：VPS git pull + restart mitake-web（見 §6.2）
+```
+
+**功能規格**：`query_message_status(msgid, *, timeout=25.0) -> dict`，走 `SmQuery?...&msgid=<id>`（**唯讀免費不扣點**），回應是 Tab 分隔的 `msgid \t statuscode \t yyyyMMddHHmmss`。狀態碼對照見 `mitake.DELIVERY_STATUS_TABLE`。
+
 ### 6.4 已知限制與待辦
 
 - **`possibly_charged` 只存在於 `MitakeAPIError`** —— Web 層已用 `getattr(..., True)` 保守處理，但 `MitakeError` 基底補一個 class-level `possibly_charged = False` 會更乾淨（見 §2.1）
