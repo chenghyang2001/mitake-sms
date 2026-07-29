@@ -1,0 +1,18 @@
+sequenceDiagram
+    autonumber
+    actor U as User
+    participant CF as Cloudflare
+    participant W as mitake-web
+    participant M as mitake.py
+    participant S as Mitake API
+    participant A as Audit Log
+
+    U->>CF: Access Request
+    CF->>W: Forward Request
+    W->>U: Display SMS Form
+    U->>W: Submit SMS
+    W->>M: Validate and Send SMS
+    M->>S: SmSend API Call
+    S-->>M: API Response
+    M-->>W: Process Response
+    W-->>U: Display Result

@@ -1,0 +1,5 @@
+graph TD;
+    A[Web Interface] -->|Sends Requests| B[API Layer]
+    B -->|Queries| C[Other]
+    B -->|Renders| D[Web Templates]
+    C -->|Monitors| E[Balance Alerts]

@@ -1,0 +1,65 @@
+sequenceDiagram
+    autonumber
+    actor U as 使用者
+    participant CF as Cloudflare<br/>Tunnel + Access
+    participant W as mitake-web<br/>127.0.0.1:8766
+    participant M as mitake.py
+    participant S as 三竹 API
+    participant A as 稽核檔
+    participant J as job_010<br/>每日 08:00
+
+    rect rgb(235, 244, 255)
+        Note over U,S: 發送簡訊（扣點）
+        U->>CF: GET /
+        CF->>CF: Access 驗證 email
+        CF->>W: 轉發 + 注入 header
+        W->>W: 應用層二次檢查 header
+        W-->>U: 發送表單（含速率 0/20）
+        U->>W: POST /preview 手機+內容
+        W->>M: count_sms_segments()
+        M-->>W: 則數與預估扣點
+        W-->>U: 確認頁 + 一次性 token
+        U->>W: POST /send（帶 token）
+        W->>W: consume(token) 只能用一次
+        W->>M: send_sms(phone, body)
+        M->>S: SmSend（扣 1 點/則）
+        S-->>M: Big5 回應
+        M->>M: decode_response + parse_response
+        alt statuscode = 1
+            M-->>W: success, msgid
+            W->>A: 寫入（號碼遮罩後四碼）
+            W-->>U: 成功頁 + 查詢連結
+        else 明確拒絕
+            M-->>W: MitakeAPIError<br/>possibly_charged=False
+            W-->>U: 可安全重試
+        else 結果未確認
+            M-->>W: MitakeAPIError<br/>possibly_charged=True
+            W-->>U: 請勿重送
+        end
+    end
+
+    rect rgb(240, 255, 240)
+        Note over U,S: 查投遞狀態（免費）
+        U->>W: GET /status?msgid=xxx
+        W->>M: query_message_status(msgid)
+        M->>S: SmQuery + msgid
+        S-->>M: msgid \t statuscode \t 時間
+        M->>M: 驗證回傳 msgid 與查詢相符
+        alt msgid 不符
+            M-->>W: MitakeAPIError<br/>kind=msgid_mismatch
+            W-->>U: 查詢無效（不顯示別則狀態）
+        else 相符
+            M-->>W: 狀態 + 中文說明
+            W-->>U: 投遞狀態頁
+        end
+    end
+
+    rect rgb(255, 250, 235)
+        Note over J,S: 排程告警（免費）
+        J->>M: query_balance()
+        M->>S: SmQuery
+        S-->>M: AccountPoint=12568
+        M-->>J: 12568
+        J->>J: 比對門檻 warn=3000 / critical=1000
+        J-->>J: 低於門檻才發三管道通知
+    end

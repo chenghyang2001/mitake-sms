@@ -1,0 +1,8 @@
+graph TD;
+    A[Development] -->|push| B[CF Tunnel]
+    B --> C[mitake-web]
+    C --> D[mitake.py]
+    D --> E[Mitake API]
+    A --> F[GitHub]
+    F -->|pull| A
+    B --> G[n8n2vps-hub]

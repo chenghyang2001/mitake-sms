@@ -1,0 +1,10 @@
+graph TD;
+    A[do_POST] --> B[_dispatch];
+    B --> C[route];
+    C --> D[handle_send];
+    D --> E[render_preview];
+    E --> F[_box];
+    E --> G[_back_link];
+    D --> H[render_sent];
+    H --> I[_box];
+    H --> J[status_query_url];

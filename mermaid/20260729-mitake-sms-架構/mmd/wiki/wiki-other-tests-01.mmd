@@ -1,0 +1,10 @@
+graph TD;
+    A[pytest] --> B[conftest.py]
+    B --> C[Global Mocking]
+    B --> D[Fixtures]
+    A --> E[test_mitake.py]
+    A --> F[test_web.py]
+    E --> G[Mocked API Calls]
+    F --> H[Web Layer Tests]
+    G --> I[Assertions]
+    H --> I

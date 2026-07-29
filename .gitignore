@@ -29,3 +29,4 @@ Thumbs.db
 
 # 機器生成的 session 快照（每輪對話自動刷新，不進版本控制）
 .claude/session-state.md
+.gitnexus

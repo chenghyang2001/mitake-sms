@@ -1,0 +1,6 @@
+graph TD;
+    A[web] --> B[web.audit]
+    A --> C[web.templates]
+    A --> D[web.server]
+    D -->|uses| B
+    D -->|renders| C

@@ -1,0 +1,50 @@
+flowchart TD
+    START(("使用者開啟<br/>sms.chenghyang.uk"))
+
+    subgraph AUTH["存取控制（兩層）"]
+        CFA{"CF Access<br/>已登入？"}
+        HDR{"應用層 header<br/>email 相符？"}
+    end
+
+    subgraph FORM["發送流程（兩階段）"]
+        F1["填手機號碼<br/>與簡訊內容"]
+        RATE{"本小時<br/>已滿 20 則？"}
+        PREV["確認頁<br/>顯示則數與扣點"]
+        TOK{"一次性 token<br/>仍有效？"}
+    end
+
+    subgraph API["三竹 API"]
+        SEND["SmSend<br/>扣 1 點／則"]
+        RESP{"回應判讀"}
+    end
+
+    subgraph RESULT["結果分流"]
+        OK["成功頁<br/>顯示 msgid<br/>附查詢連結"]
+        SAFE["失敗：沒扣點<br/>可安全重試"]
+        UNC["未確認：多半已扣點<br/>請勿重送"]
+    end
+
+    QUERY["/status 查投遞狀態<br/>SmQuery 免費"]
+    AUDIT[("send-audit.jsonl<br/>號碼遮罩留後四碼")]
+    DENY["403"]
+    LOGIN["導向 CF 登入頁"]
+
+    START --> CFA
+    CFA -->|否| LOGIN
+    CFA -->|是| HDR
+    HDR -->|不符| DENY
+    HDR -->|相符| F1
+    F1 --> RATE
+    RATE -->|是| DENY
+    RATE -->|否| PREV
+    PREV --> TOK
+    TOK -->|過期或已用| F1
+    TOK -->|有效| SEND
+    SEND --> RESP
+    RESP -->|statuscode 1| OK
+    RESP -->|possibly_charged=False| SAFE
+    RESP -->|possibly_charged=True| UNC
+    OK --> AUDIT
+    OK --> QUERY
+    UNC --> QUERY
+    SAFE --> F1

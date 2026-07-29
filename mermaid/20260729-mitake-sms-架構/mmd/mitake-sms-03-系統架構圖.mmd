@@ -1,0 +1,44 @@
+block-beta
+  columns 4
+
+  L1["① 開發<br/>本機"]:1
+  LOCAL["本機 NB00547<br/>workspace/mitake-sms<br/>master d1d201b・230 passed"]:1
+  GH["GitHub public<br/>chenghyang2001/mitake-sms"]:1
+  WARN1["⚠ VPS 要自己 git pull<br/>deploy.sh 只管 hub"]:1
+
+  space:4
+
+  L2["② 邊緣<br/>Cloudflare"]:1
+  TUNNEL["Tunnel vps-webhook<br/>config.yml 為 7 服務共用"]:1
+  ACCESS["Access policy only-me<br/>chenghyang2001@gmail.com"]:1
+  SITE["sms.chenghyang.uk"]:1
+
+  space:4
+
+  L3["③ 對外<br/>端點"]:1
+  P1["/ 發送表單<br/>兩階段・20 則每小時"]:1
+  P2["/status 投遞查詢<br/>免費・30 次每 5 分鐘"]:1
+  P3["/health<br/>免認證豁免"]:1
+
+  space:4
+
+  L4["④ VPS<br/>服務"]:1
+  SVC["mitake-web.service<br/>127.0.0.1:8766"]:1
+  MOD["mitake.py<br/>零外部依賴・兩服務共用"]:1
+  HUB["n8n2vps-hub job_010<br/>每日 08:00 餘額告警"]:1
+
+  space:4
+
+  L5["⑤ 外部<br/>與憑證"]:1
+  ENVF["/etc/mitake-sms.env<br/>權限 600・allowlist 只載 2 key"]:1
+  MITAKE["三竹 API smsapi.mitake.com.tw<br/>SmSend 扣點・SmQuery 免費"]:1
+  POOL["點數池 12568<br/>與 App 團隊共用"]:1
+
+  style L1 fill:#e8eaf6,stroke:#3f51b5
+  style L2 fill:#e8eaf6,stroke:#3f51b5
+  style L3 fill:#e8eaf6,stroke:#3f51b5
+  style L4 fill:#e8eaf6,stroke:#3f51b5
+  style L5 fill:#e8eaf6,stroke:#3f51b5
+  style WARN1 fill:#fff3cd,stroke:#856404
+  style POOL fill:#f8d7da,stroke:#721c24
+  style MOD fill:#d1ecf1,stroke:#0c5460

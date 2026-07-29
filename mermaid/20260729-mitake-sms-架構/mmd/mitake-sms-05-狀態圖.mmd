@@ -1,0 +1,46 @@
+stateDiagram-v2
+    direction TB
+
+    [*] --> 已送出: send_sms 回 statuscode=1<br/>取得 msgid（已扣 1 點）
+
+    已送出 --> 查詢中: GET /status?msgid=xxx<br/>SmQuery 免費不扣點
+
+    state 查詢中 {
+        [*] --> 解析回應
+        解析回應 --> 驗證身分: msgid \t code \t 時間
+        驗證身分 --> 已驗證: 回傳 msgid 與查詢相符
+        驗證身分 --> 拒絕: msgid 不符<br/>kind=msgid_mismatch
+        解析回應 --> 拒絕: 格式解不開<br/>kind=bad_response
+        拒絕 --> [*]
+        已驗證 --> [*]
+    }
+
+    查詢中 --> 處理中: 狀態碼 1 / 2 / 3
+    查詢中 --> 已送達手機: 狀態碼 4
+    查詢中 --> 投遞失敗: 狀態碼 5 等
+    查詢中 --> 門號有誤: 狀態碼 6
+    查詢中 --> 系統忙碌: 狀態碼 * / a / r
+    查詢中 --> 帳戶問題: 狀態碼 c / e / k
+
+    note right of 處理中
+        1/2/3 = 已送達「業者」
+        不是已送達手機
+        is_delivered = False
+        is_final = False
+    end note
+
+    note right of 已送達手機
+        唯一的 delivered 碼
+        DELIVERED_STATUSCODE = "4"
+        把 1/2/3 講成這個
+        是本專案最貴的錯誤
+    end note
+
+    處理中 --> 查詢中: 稍後再查（免費）
+    系統忙碌 --> 查詢中: 稍後再查（免費）
+
+    帳戶問題 --> [*]: 丟 MitakeAPIError<br/>走 ip_blocked / auth_failed<br/>去改設定而非重查
+
+    已送達手機 --> [*]: 最終狀態
+    投遞失敗 --> [*]: 最終狀態
+    門號有誤 --> [*]: 最終狀態

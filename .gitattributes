@@ -18,6 +18,7 @@
 *.toml      text eol=lf
 *.cfg       text eol=lf
 *.ini       text eol=lf
+*.mmd       text eol=lf
 .gitignore  text eol=lf
 .gitattributes text eol=lf
 
@@ -26,3 +27,4 @@
 *.jpg       binary
 *.pdf       binary
 *.m4a       binary
+*.pptx      binary

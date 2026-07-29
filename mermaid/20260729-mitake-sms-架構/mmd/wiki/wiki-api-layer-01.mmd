@@ -1,0 +1,12 @@
+graph TD;
+    A[API Layer] -->|uses| B[MitakeAPIError]
+    A -->|uses| C[MitakeConfigError]
+    A -->|uses| D[MitakeValidationError]
+    A -->|uses| E[send_sms]
+    A -->|uses| F[query_balance]
+    A -->|uses| G[query_message_status]
+    A -->|uses| H[decode_response]
+    A -->|uses| I[parse_response]
+    A -->|uses| J[classify_statuscode]
+    A -->|uses| K[validate_phone]
+    A -->|uses| L[count_sms_segments]

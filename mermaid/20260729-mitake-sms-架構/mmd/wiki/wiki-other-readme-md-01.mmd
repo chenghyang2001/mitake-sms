@@ -1,0 +1,6 @@
+graph TD;
+    A[User Interface] -->|Input Phone & Message| B[Send SMS via API];
+    B -->|Response| C["Handle Success/Error"];
+    C -->|Notify User| D["Telegram/Gmail Alerts"];
+    A -->|Check Balance| E[Query Balance via API];
+    E -->|Response| C;

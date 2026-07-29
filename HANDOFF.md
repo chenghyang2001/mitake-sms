@@ -334,6 +334,8 @@ A/B：新 kind `bad_response` 唯一能到 job_010 的入口是 64 KiB 上限，
 
 | 資源 | 位置 |
 | ------ | ------ |
+| **系統架構文件**（六節，含 12 條 ADR） | `doc/architecture.md` —— 想知道「為什麼這樣設計」先看它，§5 ADR 表列出每個決策的理由**與代價** |
+| **架構圖表**（架構 5 張 + GitNexus wiki 11 張 + PPTX 合輯） | `mermaid/20260729-mitake-sms-架構/`（`mmd/` 原始碼、`png/` 圖、`.pptx` 合輯）。圖用 mmdc 重生：見 `~/.claude/skills/mmd-gen` |
 | n8n2vps-hub repo（job_010 要做在這） | `%USERPROFILE%\workspace\n8n2vps-hub\`（CLAUDE.md 有完整部署規則） |
 | VPS 部署記憶（含本專案） | `~/.claude/projects/C--Users-B00332-workspace-n8n2vps-hub/memory/mitake_sms_vps_deployment.md` |
 | Cloudflare Tunnel 設定 | VPS `~/.cloudflared/config.yml` |

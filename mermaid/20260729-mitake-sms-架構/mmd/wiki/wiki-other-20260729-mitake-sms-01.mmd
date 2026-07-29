@@ -1,0 +1,7 @@
+flowchart TD
+    A[Local Development] -->|git pull| B[VPS]
+    B --> C[Cloudflare Tunnel]
+    C --> D[mitake-web Service]
+    D --> E[Mitake API]
+    D --> F[Job Scheduler]
+    F --> E

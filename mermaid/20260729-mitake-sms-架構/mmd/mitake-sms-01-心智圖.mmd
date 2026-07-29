@@ -1,0 +1,33 @@
+mindmap
+  root((三竹簡訊<br/>mitake-sms))
+    部署鏈路
+      本機 NB00547
+        master d1d201b
+        230 passed
+      GitHub public repo
+      VPS 需手動 git pull
+        deploy.sh 不管這專案
+        pull 完要 restart 兩服務
+    VPS 服務
+      mitake.py 零外部依賴
+      mitake-web 127.0.0.1:8766
+      job_010 每日 08:00 餘額告警
+        Gmail / Telegram / LINE
+      env 檔 allowlist 只載 2 key
+    對外存取
+      CF Tunnel vps-webhook
+        config 為 7 服務共用
+      CF Access policy only-me
+      應用層 header 二次檢查
+      sms.chenghyang.uk
+    三竹 API
+      SmSend 每則扣 1 點
+      SmQuery 免費
+        查餘額
+        查投遞狀態
+      點數池與 App 團隊共用
+    安全鐵律
+      IP 白名單強制
+      回應是 Big5
+      禁止自動重試
+      possibly_charged 分流

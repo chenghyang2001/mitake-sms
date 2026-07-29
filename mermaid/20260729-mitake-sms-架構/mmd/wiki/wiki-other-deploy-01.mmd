@@ -1,0 +1,6 @@
+graph TD;
+    A[User] -->|HTTP Request| B[Mitake SMS Web Service]
+    B -->|Logs| C[Audit Log]
+    B -->|Environment Variables| D[Environment File]
+    B -->|Systemd| E[Systemd Unit]
+    E -->|Manages| F[Service Lifecycle]
