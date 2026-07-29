@@ -77,7 +77,10 @@ reviewer 用**突變測試**驗過測試鎖得住：把 `except MitakeAPIError` 
 
 **投遞狀態查詢功能（`e6b3523`）已寫完但未經 QA/reviewer**，程式碼在版控裡、**尚未部署**，生產維持 `cba2d45`。
 
-已驗：146 passed、ruff 全綠、`mitake.py` 0 deletions、狀態碼對照表逐碼正確、零外部依賴。
+已驗：**179 passed**（既有 79 零回歸 + 新增 100）、ruff 全綠、`mitake.py` 0 deletions、
+狀態碼對照表逐碼正確、零外部依賴。
+（commit `e6b3523` 的 message 誤寫 146 —— 那是 writer 尚未寫完測試時的中間數字，
+已 push 故不 amend，以此處為準。）
 未驗：code-qa 的 20+ case、code-reviewer 的 adversarial review、突變測試、VPS 真實環境。
 
 接手步驟見 `HANDOFF.md` §6.5。
