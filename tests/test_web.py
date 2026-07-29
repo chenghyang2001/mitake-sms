@@ -131,6 +131,31 @@ class RecordingSender:
         return len(self.calls)
 
 
+class RecordingStatusQuery:
+    """假的 `mitake.query_message_status`：記下每次呼叫，照設定回傳或拋出。
+
+    投遞狀態查詢是唯讀免費的，但**一樣不准真的打三竹** —— 打多了會讓來源 IP 被
+    限流，而那會連發簡訊一起壞掉（statuscode=k）。
+    """
+
+    def __init__(
+        self, *, result: dict | None = None, error: BaseException | None = None
+    ) -> None:
+        self.calls: list[dict] = []
+        self._result = result if result is not None else status_result("4")
+        self._error = error
+
+    def __call__(self, msgid: str, *, timeout: float) -> dict:
+        self.calls.append({"msgid": msgid, "timeout": timeout})
+        if self._error is not None:
+            raise self._error
+        return dict(self._result)
+
+    @property
+    def call_count(self) -> int:
+        return len(self.calls)
+
+
 class FailingAuditLog(AuditLog):
     """稽核寫入永遠失敗（模擬磁碟滿／路徑不可寫）。
 
@@ -164,6 +189,28 @@ def _form(**fields: str) -> dict[str, list[str]]:
     return {key: [value] for key, value in fields.items()}
 
 
+def status_result(
+    statuscode: str = "4",
+    *,
+    msgid: str = "0315772761",
+    status_time: str = "20260729143730",
+) -> dict:
+    """組出一筆投遞狀態結果。
+
+    刻意用**真的** `mitake.parse_status_response` 去解一段真實格式的回應，而不是
+    手寫一個 dict：手寫的 dict 可以自由亂填（例如 statuscode=1 卻 is_delivered=True），
+    測起來永遠是綠的，卻證明不了 web 層拿到真實資料時會怎麼渲染。
+    這支函式不碰網路（純解析）。
+    """
+    return mitake.parse_status_response(f"{msgid}\t{statuscode}\t{status_time}")
+
+
+def query_status(app: SmsWebApp, msgid: str | None = None, **kwargs):
+    """走一次 `GET /status`（不帶 msgid 就是查詢表單頁）。"""
+    query = _form(msgid=msgid) if msgid is not None else {}
+    return app.route("GET", "/status", query=query, **kwargs)
+
+
 def make_app(
     tmp_path: Path,
     sender: RecordingSender,
@@ -174,16 +221,20 @@ def make_app(
     token_ttl_seconds: float = 600,
     token_store: TokenStore | None = None,
     require_access_email: str | None = None,
+    status_query: "RecordingStatusQuery | None" = None,
+    status_query_limit: int = 30,
 ) -> SmsWebApp:
-    """建一個完全離線的 app：假 sender、假時鐘、稽核檔落在 tmp_path。"""
+    """建一個完全離線的 app：假 sender、假 status_query、假時鐘、稽核檔落在 tmp_path。"""
     return SmsWebApp(
         sender=sender,
+        status_query=status_query,
         audit_log=(
             audit_log
             if audit_log is not None
             else AuditLog(tmp_path / "send-audit.jsonl", fsync=False)
         ),
         rate_limit=rate_limit,
+        status_query_limit=status_query_limit,
         token_ttl_seconds=token_ttl_seconds,
         token_store=token_store,
         clock=clock if clock is not None else FakeClock(),
@@ -1384,3 +1435,502 @@ def test_reused_token_message_also_covers_both_causes(tmp_path: Path) -> None:
     assert sender.call_count == 1
     assert "已被較新的" in second.text
     assert "上一頁" in second.text
+
+
+# --------------------------------------------------------------------------- #
+# 投遞狀態查詢（GET /status）—— 唯讀、免費、不扣點
+# --------------------------------------------------------------------------- #
+#
+# 這一段鎖的核心只有一句話：**「已送達業者」不可以看起來像「已送達手機」。**
+# 使用者會來這一頁，正是因為他手機沒響而畫面說「三竹已接收」；如果這一頁又用
+# 「已送達」三個字打發他，等於把「無從查證」升級成「被明確誤導」。
+
+
+def test_status_form_is_served_when_no_msgid(tmp_path: Path) -> None:
+    """沒帶 msgid 就出查詢表單，而且不該去打三竹。"""
+    status_query = RecordingStatusQuery()
+    app = make_app(tmp_path, RecordingSender(), status_query=status_query)
+
+    response = query_status(app)
+
+    assert response.status == HTTPStatus.OK
+    assert "查詢簡訊投遞狀態" in response.text
+    assert 'name="msgid"' in response.text
+    assert status_query.call_count == 0
+
+
+def test_status_page_says_delivered_to_handset_only_for_code_4(tmp_path: Path) -> None:
+    """Happy path：狀態碼 4 才可以說「已送達手機」，且要標明是最終狀態。"""
+    status_query = RecordingStatusQuery(result=status_result("4"))
+    app = make_app(tmp_path, RecordingSender(), status_query=status_query)
+
+    response = query_status(app, "0315772761")
+
+    assert response.status == HTTPStatus.OK
+    assert "已送達手機" in response.text
+    assert "最終狀態" in response.text
+    assert status_query.calls == [
+        {"msgid": "0315772761", "timeout": pytest.approx(25.0)}
+    ]
+
+
+@pytest.mark.parametrize("code", ["1", "2", "3"])
+def test_carrier_delivery_is_never_shown_as_delivered_to_handset(
+    tmp_path: Path, code: str
+) -> None:
+    """**本功能最重要的一條 web 層回歸鎖。**
+
+    狀態碼 1–3 的官方說明就是「已送達業者」。頁面必須：
+    (1) 明講還沒到手機、(2) 說這不是最終狀態、可稍後再查、
+    (3) 標題與說明區絕不出現「已送達手機」（那是狀態碼 4 專用的）。
+    """
+    app = make_app(
+        tmp_path,
+        RecordingSender(),
+        status_query=RecordingStatusQuery(result=status_result(code)),
+    )
+
+    text = query_status(app, "0315772761").text
+    # 頁尾那段固定的對照說明本來就會提到「已送達手機」（它正是在解釋兩者差別），
+    # 所以只檢查它之前的內容 —— 也就是標題、狀態方塊與明細。
+    above_legend = text.split("三竹的「已送達業者」")[0]
+
+    assert "已送達業者" in above_legend
+    assert "已送達手機" not in above_legend
+    assert "還沒" in above_legend
+    assert "不是最終狀態" in above_legend
+    # 對照說明（業者 ≠ 手機）在每一頁都要出現，這是整個功能的立足點。
+    assert "<strong>不代表</strong>對方收到" in text
+
+
+def test_failed_status_page_says_final_and_not_delivered(tmp_path: Path) -> None:
+    """失敗類（門號有錯誤）要講清楚「沒有送達」且「再查也不會變」。"""
+    app = make_app(
+        tmp_path,
+        RecordingSender(),
+        status_query=RecordingStatusQuery(result=status_result("6")),
+    )
+
+    text = query_status(app, "0315772761").text
+
+    assert "門號有錯誤" in text
+    assert "沒有送達" in text
+    assert "不會退回" in text
+
+
+def test_unknown_status_code_page_refuses_to_claim_delivery(tmp_path: Path) -> None:
+    """沒收錄的碼要老實說不知道，並明講「不要假設對方已經收到」。"""
+    app = make_app(
+        tmp_path,
+        RecordingSender(),
+        status_query=RecordingStatusQuery(result=status_result("Z")),
+    )
+
+    text = query_status(app, "0315772761").text
+
+    assert "無法辨識的狀態碼" in text
+    assert "請不要假設對方已經收到" in text
+
+
+def test_system_error_status_tells_user_to_retry_not_to_fix_settings(
+    tmp_path: Path,
+) -> None:
+    """系統類狀態碼是三竹那端的事，要導向「稍後再查」而不是「去改設定」。"""
+    app = make_app(
+        tmp_path,
+        RecordingSender(),
+        status_query=RecordingStatusQuery(result=status_result("*")),
+    )
+
+    text = query_status(app, "0315772761").text
+
+    assert "系統發生錯誤" in text
+    assert "稍後再查" in text
+
+
+def test_status_page_formats_the_status_time(tmp_path: Path) -> None:
+    """狀態時間要排成人看得懂的樣子，並標明是台灣時間（要拿去跟後台對帳）。"""
+    app = make_app(
+        tmp_path,
+        RecordingSender(),
+        status_query=RecordingStatusQuery(
+            result=status_result("4", status_time="20260729143730")
+        ),
+    )
+
+    text = query_status(app, "0315772761").text
+
+    assert "2026-07-29 14:37:30（台灣時間）" in text
+
+
+def test_status_page_shows_unexpected_time_format_verbatim(tmp_path: Path) -> None:
+    """格式不符時原樣顯示，不自己重排 —— 重排錯了就對不上三竹後台。"""
+    app = make_app(
+        tmp_path,
+        RecordingSender(),
+        status_query=RecordingStatusQuery(
+            result=status_result("4", status_time="2026/07/29")
+        ),
+    )
+
+    assert "2026/07/29" in query_status(app, "0315772761").text
+
+
+def test_invalid_msgid_is_rejected_before_reaching_mitake(tmp_path: Path) -> None:
+    """Error case：格式就錯的 msgid 不該打出去，且要回填讓人看到自己打錯什麼。"""
+    status_query = RecordingStatusQuery()
+    app = make_app(tmp_path, RecordingSender(), status_query=status_query)
+
+    response = query_status(app, "not a msgid")
+
+    assert response.status == HTTPStatus.BAD_REQUEST
+    assert status_query.call_count == 0
+    assert "沒有查詢，也沒有扣點" in response.text
+    assert 'value="not a msgid"' in response.text  # 原樣回填
+
+
+def test_status_page_escapes_user_supplied_msgid(tmp_path: Path) -> None:
+    """XSS：msgid 來自網址列，是這個功能最容易被塞東西的地方。"""
+    app = make_app(tmp_path, RecordingSender(), status_query=RecordingStatusQuery())
+    payload = '"><script>alert(1)</script>'
+
+    response = query_status(app, payload)
+
+    assert response.status == HTTPStatus.BAD_REQUEST
+    assert "<script>alert(1)</script>" not in response.text
+    assert _html_escape(payload, quote=True) in response.text
+
+
+def test_status_result_page_escapes_fields_echoed_from_mitake(tmp_path: Path) -> None:
+    """連三竹回傳的欄位也要跳脫：它同樣是外部輸入，不因為來自上游就可信。"""
+    evil = status_result("4")
+    evil["msgid"] = '"><script>alert(1)</script>'
+    app = make_app(
+        tmp_path, RecordingSender(), status_query=RecordingStatusQuery(result=evil)
+    )
+
+    text = query_status(app, "0315772761").text
+
+    assert "<script>alert(1)</script>" not in text
+
+
+def test_status_ip_blocked_points_at_configuration_not_retry(tmp_path: Path) -> None:
+    """IP 不在白名單是設定問題，重查一百次也一樣 —— 要導向申請白名單。"""
+    error = mitake.MitakeAPIError(
+        "三竹拒絕這次查詢：無效的連線位址",
+        statuscode="k",
+        kind=mitake.KIND_IP_BLOCKED,
+        possibly_charged=False,
+    )
+    app = make_app(
+        tmp_path, RecordingSender(), status_query=RecordingStatusQuery(error=error)
+    )
+
+    response = query_status(app, "0315772761")
+
+    assert response.status == HTTPStatus.BAD_GATEWAY
+    assert "白名單" in response.text
+    assert "未扣點" in response.text
+    assert "重查不會成功" in response.text
+
+
+def test_status_auth_failed_points_at_credentials(tmp_path: Path) -> None:
+    """帳密錯同樣是設定問題，要指向 /etc/mitake-sms.env 而不是叫人重試。"""
+    error = mitake.MitakeAPIError(
+        "三竹拒絕這次查詢：帳號、密碼錯誤",
+        statuscode="e",
+        kind=mitake.KIND_AUTH_FAILED,
+        possibly_charged=False,
+    )
+    app = make_app(
+        tmp_path, RecordingSender(), status_query=RecordingStatusQuery(error=error)
+    )
+
+    response = query_status(app, "0315772761")
+
+    assert response.status == HTTPStatus.BAD_GATEWAY
+    assert "mitake-sms.env" in response.text
+    assert "未扣點" in response.text
+
+
+def test_status_network_error_says_no_charge_and_safe_to_retry(tmp_path: Path) -> None:
+    """一般查詢失敗：一定要講「沒有扣點」。
+
+    這個服務的使用者已經被訓練成看到「失敗」就擔心錢。查詢是唯讀免費的，
+    不講清楚只會讓人為一個免費操作提心吊膽，甚至不敢再查。
+    """
+    error = mitake.MitakeAPIError(
+        "無法連線至三竹 API", kind=mitake.KIND_NETWORK, possibly_charged=False
+    )
+    app = make_app(
+        tmp_path, RecordingSender(), status_query=RecordingStatusQuery(error=error)
+    )
+
+    response = query_status(app, "0315772761")
+
+    assert response.status == HTTPStatus.BAD_GATEWAY
+    assert "沒有扣點" in response.text
+    assert "再查一次" in response.text
+
+
+def test_status_config_error_page(tmp_path: Path) -> None:
+    """憑證沒設：查不了，但也沒扣點；訊息只能有變數名稱、不能有值。"""
+    error = mitake.MitakeConfigError("缺少三竹憑證環境變數：MITAKE_USERNAME")
+    app = make_app(
+        tmp_path, RecordingSender(), status_query=RecordingStatusQuery(error=error)
+    )
+
+    response = query_status(app, "0315772761")
+
+    assert response.status == HTTPStatus.INTERNAL_SERVER_ERROR
+    assert "沒有扣點" in response.text
+    assert "MITAKE_USERNAME" in response.text
+
+
+def test_status_unexpected_exception_does_not_leak_internals(tmp_path: Path) -> None:
+    """未預期的例外要被接住，且不把內部細節送到瀏覽器。"""
+    app = make_app(
+        tmp_path,
+        RecordingSender(),
+        status_query=RecordingStatusQuery(error=RuntimeError("內部路徑 /home/secret")),
+    )
+
+    response = query_status(app, "0315772761")
+
+    assert response.status == HTTPStatus.BAD_GATEWAY
+    assert "/home/secret" not in response.text
+    assert "沒有扣點" in response.text
+
+
+def test_status_future_mitake_error_is_contained(tmp_path: Path) -> None:
+    """mitake.py 日後新增的例外型別要落到通用畫面，不該整個 500。"""
+    app = make_app(
+        tmp_path,
+        RecordingSender(),
+        status_query=RecordingStatusQuery(error=FutureMitakeError("未來的錯誤")),
+    )
+
+    assert query_status(app, "0315772761").status == HTTPStatus.BAD_GATEWAY
+
+
+def test_status_only_accepts_get(tmp_path: Path) -> None:
+    """/status 只收 GET：查詢冪等且免費，用 POST 會讓「重新整理」跳出嚇人的重送對話框。"""
+    app = make_app(tmp_path, RecordingSender(), status_query=RecordingStatusQuery())
+
+    response = app.route("POST", "/status", _form(msgid="0315772761"))
+
+    assert response.status == HTTPStatus.METHOD_NOT_ALLOWED
+
+
+def test_status_is_protected_by_access_email_check(tmp_path: Path) -> None:
+    """設了 Access 檢查之後，/status 一樣要擋（只有 /health 豁免）。"""
+    status_query = RecordingStatusQuery()
+    app = make_app(
+        tmp_path,
+        RecordingSender(),
+        status_query=status_query,
+        require_access_email="peter@example.com",
+    )
+
+    denied = query_status(app, "0315772761", headers=access_headers(None))
+    allowed = query_status(
+        app, "0315772761", headers=access_headers("peter@example.com")
+    )
+
+    assert denied.status == HTTPStatus.FORBIDDEN
+    assert allowed.status == HTTPStatus.OK
+    assert status_query.call_count == 1  # 被擋下的那次沒有打出去
+
+
+def test_status_query_never_consumes_the_send_rate_limit(tmp_path: Path) -> None:
+    """**額度不可混用**：查詢是免費的，不該吃掉「還能發幾則」的預算。
+
+    共用一個計數器的話，查幾次投遞狀態就會害使用者發不出簡訊 ——
+    免費操作擋掉付費操作，是最不該有的耦合。
+    """
+    app = make_app(
+        tmp_path,
+        RecordingSender(),
+        status_query=RecordingStatusQuery(),
+        rate_limit=1,
+    )
+
+    for _ in range(5):
+        assert query_status(app, "0315772761").status == HTTPStatus.OK
+
+    assert app.rate_limiter.snapshot().used == 0
+    # 發送額度沒被吃掉，該送的還是送得出去。
+    assert send_once(app).status == HTTPStatus.OK
+
+
+def test_sending_never_consumes_the_status_query_quota(tmp_path: Path) -> None:
+    """反方向也要成立：發簡訊不該吃掉查詢次數。"""
+    app = make_app(tmp_path, RecordingSender(), status_query=RecordingStatusQuery())
+
+    assert send_once(app).status == HTTPStatus.OK
+
+    assert app.status_throttle.used == 0
+
+
+def test_status_throttle_blocks_runaway_refresh(tmp_path: Path) -> None:
+    """節流：擋得住放著自動重整的分頁。
+
+    查詢不用錢，但每次都是對三竹的一個真實請求；打太密集會讓來源 IP 被限流，
+    而那會連**發簡訊**一起壞掉（statuscode=k）。節流保的是發送能力。
+    """
+    clock = FakeClock()
+    app = make_app(
+        tmp_path,
+        RecordingSender(),
+        status_query=RecordingStatusQuery(),
+        clock=clock,
+        status_query_limit=2,
+    )
+
+    assert query_status(app, "0315772761").status == HTTPStatus.OK
+    assert query_status(app, "0315772761").status == HTTPStatus.OK
+    blocked = query_status(app, "0315772761")
+
+    assert blocked.status == HTTPStatus.TOO_MANY_REQUESTS
+    assert "不扣點" in blocked.text
+
+    # 視窗滑過去之後要自己恢復（不需要重啟服務）。
+    clock.advance(301)
+    assert query_status(app, "0315772761").status == HTTPStatus.OK
+
+
+def test_invalid_msgid_does_not_burn_status_quota(tmp_path: Path) -> None:
+    """打錯字不該吃掉查詢額度：那次根本沒有對三竹發出任何請求。"""
+    app = make_app(
+        tmp_path,
+        RecordingSender(),
+        status_query=RecordingStatusQuery(),
+        status_query_limit=1,
+    )
+
+    assert query_status(app, "bad msgid").status == HTTPStatus.BAD_REQUEST
+    assert app.status_throttle.used == 0
+    assert query_status(app, "0315772761").status == HTTPStatus.OK
+
+
+def test_status_query_receives_the_normalized_msgid(tmp_path: Path) -> None:
+    """送進 mitake 的是驗證＋去空白後的值，不是使用者的原始字串。"""
+    status_query = RecordingStatusQuery()
+    app = make_app(tmp_path, RecordingSender(), status_query=status_query)
+
+    query_status(app, "  0315772761  ")
+
+    assert status_query.calls[0]["msgid"] == "0315772761"
+
+
+def test_status_pages_have_no_script_and_get_the_strictest_csp(tmp_path: Path) -> None:
+    """查詢頁沒有腳本 → nonce 為 None → CSP 直接給 script-src 'none'（比 nonce 更嚴）。"""
+    app = make_app(tmp_path, RecordingSender(), status_query=RecordingStatusQuery())
+
+    form_page = query_status(app)
+    result_page = query_status(app, "0315772761")
+
+    for response in (form_page, result_page):
+        assert response.nonce is None
+        assert "<script" not in response.text
+        assert "script-src 'none'" in _csp_header(response.nonce)
+
+
+def test_sent_page_links_to_the_status_of_that_message(tmp_path: Path) -> None:
+    """**這個功能最有價值的入口**：成功頁要能一鍵查剛發那則的投遞狀態。
+
+    在此之前，使用者在成功頁看到「三竹已接收」就沒有下文了 —— 手機沒響時
+    只能相信或懷疑。連結必須帶上該次的 msgid，否則他還得手抄一串數字再貼回來。
+    """
+    sender = RecordingSender(result={"msgid": "0313887539", "account_point": 12572})
+    app = make_app(tmp_path, sender, status_query=RecordingStatusQuery())
+
+    text = send_once(app).text
+
+    assert 'href="/status?msgid=0313887539"' in text
+    assert "不等於" in text  # 要明講「三竹已接收 ≠ 對方收到」
+    # 成功頁的老規矩不變：不放任何會送出東西的元件。
+    assert "<form" not in text
+
+
+def test_sent_page_has_no_status_link_without_msgid(tmp_path: Path) -> None:
+    """沒有 msgid 就不給一個點下去必定查無結果的死連結。"""
+    sender = RecordingSender(result={"msgid": None, "account_point": 12572})
+    app = make_app(tmp_path, sender, status_query=RecordingStatusQuery())
+
+    text = send_once(app).text
+
+    assert "/status?msgid=" not in text
+
+
+def test_sent_page_url_encodes_the_msgid(tmp_path: Path) -> None:
+    """msgid 進網址前要 URL-encode，進 HTML 前要跳脫（兩者都不能少）。"""
+    sender = RecordingSender(result={"msgid": "a b&c", "account_point": 1})
+    app = make_app(tmp_path, sender, status_query=RecordingStatusQuery())
+
+    text = send_once(app).text
+
+    assert 'href="/status?msgid=a%20b%26c"' in text
+
+
+def test_form_page_offers_a_status_lookup_entry(tmp_path: Path) -> None:
+    """表單頁也要有入口（使用者晚點回來查時，手上只有 msgid）。"""
+    app = make_app(tmp_path, RecordingSender(), status_query=RecordingStatusQuery())
+
+    text = app.route("GET", "/").text
+
+    assert 'href="/status"' in text
+
+
+def test_status_tone_table_covers_every_mitake_category() -> None:
+    """把 templates 那份分類字串與 mitake 的常數釘在一起。
+
+    templates.py 刻意不 import mitake（見該檔 `_STATUS_TONE` 的註解），代價是兩邊
+    各寫一份字串。這支測試就是那份重複的鎖：任何一邊改了名字，這裡立刻紅燈，
+    不會靜默漂成「查到的狀態永遠用 unknown 的樣式顯示」。
+    """
+    mitake_categories = {
+        mitake.DELIVERY_PENDING,
+        mitake.DELIVERY_DELIVERED,
+        mitake.DELIVERY_FAILED,
+        mitake.DELIVERY_ERROR,
+        mitake.DELIVERY_ACCOUNT_ERROR,
+        mitake.DELIVERY_UNKNOWN,
+    }
+    assert set(templates._STATUS_TONE) == mitake_categories
+    # 對照表用到的每個分類都在這份清單裡（不會冒出沒人認得的第七種）。
+    assert {
+        category for _, category in mitake.DELIVERY_STATUS_TABLE.values()
+    } <= mitake_categories
+
+
+def test_live_server_passes_the_query_string_to_the_status_page(tmp_path: Path) -> None:
+    """端對端：``?msgid=`` 真的有從 HTTP 層傳到路由層。
+
+    上面所有查詢測試都直接呼叫 ``SmsWebApp.route()``，餵的是已經解析好的 query
+    dict —— 那條路徑驗不到 ``_dispatch`` 有沒有真的去解析網址上的 query string。
+    漏掉那一步的症狀是：不論帶什麼 msgid，畫面永遠只出查詢表單（因為 app 收到的
+    是空 dict），而每一支單元測試都還是綠的。所以這條非開真的 socket 不可。
+
+    仍然不連任何外部主機：status_query 是假的。
+    """
+    status_query = RecordingStatusQuery(result=status_result("4"))
+    app = make_app(tmp_path, RecordingSender(), status_query=status_query)
+    server = create_server(app, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address[0], server.server_address[1]
+        with urllib.request.urlopen(
+            f"http://{host}:{port}/status?msgid=0315772761", timeout=5
+        ) as response:
+            html = response.read().decode("utf-8")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status_query.calls == [
+        {"msgid": "0315772761", "timeout": pytest.approx(25.0)}
+    ]
+    assert "已送達手機" in html

@@ -50,6 +50,15 @@ __all__ = [
     "BASE_URL",
     "CHARS_PER_SEGMENT",
     "DEFAULT_TIMEOUT_SECONDS",
+    "DELIVERED_STATUSCODE",
+    "DELIVERY_ACCOUNT_ERROR",
+    "DELIVERY_DELIVERED",
+    "DELIVERY_ERROR",
+    "DELIVERY_FAILED",
+    "DELIVERY_FINAL_CATEGORIES",
+    "DELIVERY_PENDING",
+    "DELIVERY_STATUS_TABLE",
+    "DELIVERY_UNKNOWN",
     "KIND_API",
     "KIND_AUTH_FAILED",
     "KIND_DECODE",
@@ -64,9 +73,13 @@ __all__ = [
     "classify_statuscode",
     "count_sms_segments",
     "decode_response",
+    "describe_delivery_status",
     "parse_response",
+    "parse_status_response",
     "query_balance",
+    "query_message_status",
     "send_sms",
+    "validate_msgid",
     "validate_phone",
 ]
 
@@ -737,6 +750,264 @@ def send_sms(
         result.get("account_point"),
     )
     return result
+
+
+# --------------------------------------------------------------------------- #
+# 投遞狀態查詢（SmQuery + msgid）—— 唯讀、免費、不扣點
+# --------------------------------------------------------------------------- #
+#
+# 這一整段是**純新增**：上面的查餘額／發送流程一行都沒動。原因是 mitake.py 已部署
+# 在 VPS 上，餘額告警排程每天 08:00 直接 import 它，改既有函式的風險遠高於這個功能
+# 的價值。
+#
+# 為什麼需要這個功能：send_sms 成功只代表「三竹收下了」（statuscode=1），
+# **不代表對方手機收到**。兩者之間還有一段電信商投遞，短則數秒、長則失敗。
+# 在此之前，Web 介面顯示「三竹已接收」之後就沒有下文，使用者手機沒響時無從查證。
+#
+# 端點與查餘額**完全相同**（SmQuery），差別只在多帶一個 msgid 參數：
+#
+#     GET /api/mtk/SmQuery?username=X&password=Y            → AccountPoint=12571
+#     GET /api/mtk/SmQuery?username=X&password=Y&msgid=NNN  → NNN<TAB>4<TAB>20260729143730
+#
+# 注意兩種回應的**格式完全不同**：前者是 key=value，後者是 Tab 分隔的三欄。
+# 所以這裡另寫 parse_status_response，不去動 parse_response——把 Tab 格式硬塞進
+# 既有解析器，等於為了一個新功能去改一支每天都在跑的函式。
+
+# 狀態分類。分類的用途是「畫面該怎麼講、使用者接下來該做什麼」，不是原樣照抄三竹文件。
+DELIVERY_PENDING = "pending"  # 還在路上，稍後再查會變
+DELIVERY_DELIVERED = "delivered"  # 已送達手機，最終狀態
+DELIVERY_FAILED = "failed"  # 確定沒送到，最終狀態
+DELIVERY_ERROR = "error"  # 三竹系統層異常，與這則簡訊無關
+DELIVERY_ACCOUNT_ERROR = "account_error"  # 帳號／IP 設定問題，查詢根本沒查成
+DELIVERY_UNKNOWN = "unknown"  # 三竹回了本模組沒收錄的碼
+
+# 狀態碼 →（中文說明, 分類）。依三竹官方文件 v2.09。
+#
+# ⚠️ **這張表最不該抄錯的地方是 1–3 與 4 的差別。**
+# 1/2/3 是「已送達**業者**」——三竹把簡訊交給電信商了，僅此而已；
+# 只有 4 是「已送達**手機**」——對方門號真的收到了。
+# 把 1–3 講成「已送達手機」會讓使用者相信對方收到了而不再追，
+# 而那正是這個功能要解決的問題本身。
+DELIVERY_STATUS_TABLE: dict[str, tuple[str, str]] = {
+    "0": ("預約傳送中", DELIVERY_PENDING),
+    "1": ("已送達業者", DELIVERY_PENDING),
+    "2": ("已送達業者", DELIVERY_PENDING),
+    "3": ("已送達業者", DELIVERY_PENDING),
+    "4": ("已送達手機", DELIVERY_DELIVERED),
+    "5": ("內容有錯誤", DELIVERY_FAILED),
+    "6": ("門號有錯誤", DELIVERY_FAILED),
+    "7": ("簡訊已停用", DELIVERY_FAILED),
+    "8": ("逾時無送達", DELIVERY_FAILED),
+    "9": ("預約已取消", DELIVERY_FAILED),
+    "*": ("系統發生錯誤", DELIVERY_ERROR),
+    "a": ("簡訊發送功能暫時停止", DELIVERY_ERROR),
+    "b": ("簡訊發送功能暫時停止", DELIVERY_ERROR),
+    "c": ("請輸入帳號", DELIVERY_ACCOUNT_ERROR),
+    "d": ("請輸入密碼", DELIVERY_ACCOUNT_ERROR),
+    "e": ("帳號、密碼錯誤", DELIVERY_ACCOUNT_ERROR),
+    "f": ("帳號已過期", DELIVERY_ACCOUNT_ERROR),
+    "h": ("帳號已被停用", DELIVERY_ACCOUNT_ERROR),
+    "k": ("無效的連線位址", DELIVERY_ACCOUNT_ERROR),
+    "m": ("必須變更密碼", DELIVERY_ACCOUNT_ERROR),
+    "n": ("密碼已逾期", DELIVERY_ACCOUNT_ERROR),
+    "p": ("無權限使用外部 HTTP 程式", DELIVERY_ACCOUNT_ERROR),
+    "r": ("系統暫停服務", DELIVERY_ERROR),
+    "s": ("帳務處理失敗", DELIVERY_ERROR),
+    "t": ("簡訊已過期", DELIVERY_FAILED),
+    "u": ("簡訊內容不得為空白", DELIVERY_FAILED),
+    "v": ("無效的手機號碼", DELIVERY_FAILED),
+}
+
+# 唯一代表「對方手機真的收到了」的碼。單獨拉出來當常數，是為了讓
+# is_delivered 的判斷只有一個出處——這個布林值會直接決定畫面上寫「已送達手機」
+# 還是「還沒送到」，不能散落在各處各判各的。
+DELIVERED_STATUSCODE = "4"
+
+# 最終狀態＝再查也不會變的分類。pending 之外的兩個「錯誤」分類刻意不算最終：
+# 系統錯誤（三竹那端暫時異常）稍後再查可能就有答案了，講成最終狀態會讓人放棄追查。
+DELIVERY_FINAL_CATEGORIES = frozenset({DELIVERY_DELIVERED, DELIVERY_FAILED})
+
+# msgid 會被原樣拼進 query string，所以字元集刻意收得很緊：只收英數、底線、連字號。
+# 放寬到「什麼都收」的話，使用者在網址列塞 `&password=` 之類的東西就能改寫我們送給
+# 三竹的參數（urlencode 會跳脫，但這種輸入本來就不可能是合法 msgid，早點擋掉更省事）。
+# 上限 64 是安全裕度：實測 msgid 是 10 碼數字。
+_MSGID_PATTERN = re.compile(r"^[0-9A-Za-z_-]{1,64}$")
+
+
+def validate_msgid(msgid: str) -> str:
+    """驗證並正規化 msgid（只去除前後空白，不改寫內容）。
+
+    合法回傳去空白後的字串；不合法丟 :class:`MitakeValidationError`。
+    與 :func:`validate_phone` 一樣，這類錯誤一律在送出網路請求**之前**丟出。
+    """
+    if not isinstance(msgid, str):
+        raise MitakeValidationError(f"msgid 必須是字串，收到 {type(msgid).__name__}")
+
+    cleaned = msgid.strip()
+    if not cleaned:
+        raise MitakeValidationError("msgid 不可為空白")
+
+    if not _MSGID_PATTERN.match(cleaned):
+        raise MitakeValidationError(
+            f"msgid 格式不符，只接受 1 至 64 個半形英數字、底線或連字號：輸入 {msgid!r}"
+        )
+
+    return cleaned
+
+
+def describe_delivery_status(statuscode: str | None) -> tuple[str, str]:
+    """把狀態碼翻成 ``(中文說明, 分類)``；沒收錄的碼回 ``DELIVERY_UNKNOWN``。
+
+    **大小寫敏感**（三竹的碼本來就是小寫）。把未知碼歸成 unknown 而不是猜一個最接近
+    的分類，是同一條老規矩：寧可說「不知道」讓人去查，也不要謊報「已送達」。
+    """
+    known = DELIVERY_STATUS_TABLE.get(statuscode) if statuscode is not None else None
+    if known is None:
+        return ("未知狀態碼（三竹未定義，或本模組尚未收錄）", DELIVERY_UNKNOWN)
+    return known
+
+
+def parse_status_response(text: str) -> dict[str, Any]:
+    """解析「以 msgid 查投遞狀態」的回應（**Tab 分隔**，與 :func:`parse_response` 無關）。
+
+    實測格式（Big5、單行、三欄）::
+
+        0315772761	4	20260729143730
+           msgid   狀態碼  狀態時間（yyyyMMddHHmmss，台灣時間）
+
+    回傳欄位：
+
+    ``msgid`` / ``statuscode`` / ``status_time``
+        三竹回報的原始字串（第三欄缺漏時 ``status_time`` 為 None）。
+    ``description`` / ``category``
+        中文說明與分類，來自 :data:`DELIVERY_STATUS_TABLE`。
+    ``is_delivered``
+        **只有 statuscode 恰為 ``"4"`` 才是 True。** 1–3 是「已送達業者」，
+        代表交給電信商了而已，對方手機不一定收到。
+    ``is_final``
+        是否為最終狀態（已送達手機／確定失敗）。False 代表稍後再查會變。
+    ``raw_text``
+        原始整段文字，供日後三竹改格式時追查。
+
+    格式不符（空回應、欄位不足、拿到 key=value 格式）一律丟
+    :class:`MitakeAPIError`（``possibly_charged`` 恆為 False —— 這是唯讀查詢）。
+    刻意不「盡量湊出一個結果」：湊出來的狀態會被畫面當成真的投遞結果顯示，
+    而使用者無從分辨那是三竹說的還是我們猜的。
+    """
+    if not isinstance(text, str):
+        raise MitakeValidationError(
+            f"parse_status_response 需要 str，收到 {type(text).__name__}"
+        )
+
+    # 與 parse_response 相同的換行容忍度：\r\n 是實測值，但單獨的 \r / \n 也吃。
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    # 取第一行有內容的。行首行尾**只去空白與換行，不去 Tab** —— Tab 是欄位分隔符，
+    # 一律 strip() 的話，開頭是空 msgid 的回應（"\t4\t2026…"）會被去掉前導 Tab，
+    # 整排欄位往左位移一格，狀態碼就被讀成 msgid、時間被讀成狀態碼。那個結果不會
+    # 報錯，只會靜靜地顯示一個錯的狀態。
+    line = next((s for s in (raw.strip(" \n") for raw in normalized.split("\n")) if s), "")
+    if not line:
+        raise MitakeAPIError(
+            f"三竹狀態查詢回應是空的：{text!r}",
+            kind=KIND_API,
+            possibly_charged=False,
+        )
+
+    fields = [field.strip() for field in line.split("\t")]
+    if len(fields) < 2:
+        # 有些中間層會把 Tab 改寫成空白。退一步用任意空白切，總比整筆判為壞掉好。
+        fields = line.split()
+
+    if len(fields) < 2 or not fields[0] or not fields[1]:
+        raise MitakeAPIError(
+            "三竹狀態查詢回應格式不符（預期 msgid、狀態碼、狀態時間三欄，"
+            f"以 Tab 分隔）：{text!r}",
+            kind=KIND_API,
+            possibly_charged=False,
+        )
+
+    msgid, statuscode = fields[0], fields[1]
+    status_time = fields[2] if len(fields) > 2 and fields[2] else None
+    description, category = describe_delivery_status(statuscode)
+
+    return {
+        "msgid": msgid,
+        "statuscode": statuscode,
+        "description": description,
+        "category": category,
+        "status_time": status_time,
+        "is_delivered": statuscode == DELIVERED_STATUSCODE,
+        "is_final": category in DELIVERY_FINAL_CATEGORIES,
+        "raw_text": text,
+    }
+
+
+def query_message_status(
+    msgid: str, *, timeout: float = DEFAULT_TIMEOUT_SECONDS
+) -> dict[str, Any]:
+    """查詢一則已發送簡訊的投遞狀態（SmQuery + msgid，**唯讀、免費、不扣點**）。
+
+    走的是與 :func:`query_balance` 同一個 ``SmQuery`` 端點，所以
+    :func:`_request` 算出的 ``charged`` 恆為 False —— 這條路徑上任何失敗的
+    ``possibly_charged`` 都是 False，可以安全重查。**不要**把它改成走 ``SmSend``。
+
+    回傳值即 :func:`parse_status_response` 的結果（欄位說明見該函式）。
+
+    兩種失敗要分清楚，因為處理方式完全不同：
+
+    * **帳戶類狀態碼**（``c``/``d``/``e``/``f``/``h``/``k``/``m``/``n``/``p``）
+      代表三竹根本沒去查這則簡訊，是我們這端的帳號或 IP 白名單設定壞了。
+      這種一律丟 :class:`MitakeAPIError`，``kind`` 走既有的
+      :func:`classify_statuscode`（``k`` → ``ip_blocked``、``e`` → ``auth_failed``），
+      讓上層沿用既有的「這是設定問題，重試沒用」畫面。
+      把它當成一個查詢結果回傳，畫面就會寫成「這則簡訊的狀態是：帳號、密碼錯誤」——
+      那是假的，那不是這則簡訊的狀態。
+    * **系統類狀態碼**（``*``/``a``/``b``/``r``/``s``）代表三竹那端暫時異常，
+      這裡**照常回傳**（``category=DELIVERY_ERROR``、``is_final=False``），
+      讓畫面可以說「三竹系統忙碌，稍後再查」而不是把人導去改設定。
+    """
+    clean_msgid = validate_msgid(msgid)
+
+    parsed = _request(ENDPOINT_QUERY, {"msgid": clean_msgid}, timeout=timeout)
+
+    # 帳密／IP 錯誤時三竹回的是 key=value 格式（statuscode=e / Error=…），
+    # 與正常狀態回應的 Tab 格式完全不同。交給既有的 _raise_if_failed 分類，
+    # 上層拿到的 kind 與查餘額失敗時完全一致。
+    if parsed["error"] is not None:
+        _raise_if_failed(parsed, ENDPOINT_QUERY)
+
+    status = parse_status_response(parsed["raw_text"])
+
+    if status["category"] == DELIVERY_ACCOUNT_ERROR:
+        raise MitakeAPIError(
+            "三竹拒絕這次查詢（statuscode={}）：{}。"
+            "這是帳號或連線位址的設定問題，不是這則簡訊的投遞結果。".format(
+                status["statuscode"], status["description"]
+            ),
+            statuscode=status["statuscode"],
+            error_text=status["description"],
+            kind=classify_statuscode(status["statuscode"]),
+            possibly_charged=False,
+            response=status,
+        )
+
+    if status["msgid"] != clean_msgid:
+        # 三竹正常會回傳你問的那個 msgid。對不上時仍照回（不猜、不改寫），
+        # 但要留一行線索：畫面上顯示的狀態可能不是你查的那則。
+        logger.warning(
+            "三竹回傳的 msgid 與查詢的不符：查詢=%s 回傳=%s",
+            clean_msgid,
+            status["msgid"],
+        )
+
+    # 只記 msgid 與狀態碼：這兩者不是個資，也不含簡訊內容。
+    logger.info(
+        "查詢投遞狀態：msgid=%s statuscode=%s（%s）",
+        clean_msgid,
+        status["statuscode"],
+        status["description"],
+    )
+    return status
 
 
 # --------------------------------------------------------------------------- #

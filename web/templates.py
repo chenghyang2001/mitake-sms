@@ -21,22 +21,31 @@
 from __future__ import annotations
 
 from html import escape as _e
+from urllib.parse import quote as _q
 
 __all__ = [
     "REASON_CONFIG_MISSING",
     "REASON_MITAKE_REJECTED",
     "REASON_NEVER_REACHED_MITAKE",
     "REASON_VALIDATION_BLOCKED",
+    "STATUS_PATH",
     "render_failed_safe",
     "render_failed_unconfirmed",
     "render_form",
     "render_notice",
     "render_preview",
     "render_sent",
+    "render_status_form",
+    "render_status_result",
+    "status_query_url",
 ]
 
 # 三竹後台網址只出現在「請勿重送、去查證」的畫面上，用具名常數避免各處抄錯。
 _MITAKE_CONSOLE_URL = "https://smsapi.mitake.com.tw/"
+
+# 投遞狀態查詢頁的路徑。樣板與路由層共用同一個常數，改路徑時不會只改到一邊
+# （只改一邊的症狀是成功頁那個連結變成 404 —— 而那正是這個功能唯一的入口）。
+STATUS_PATH = "/status"
 
 # 「為什麼沒扣點」的四種說法。四種的**結論相同**（沒扣點、可安全重送），差別在
 # 三竹到底有沒有收到這次請求 —— 這件事決定了使用者接下來該去哪裡查、該找誰修。
@@ -184,6 +193,60 @@ def _hidden_resend_form(phone: str, body: str, label: str) -> str:
     )
 
 
+def status_query_url(msgid: str) -> str:
+    """組出「查這則 msgid 的投遞狀態」的網址。
+
+    回傳值**尚未 HTML 跳脫**（只做了 URL-encode），放進 HTML 屬性前仍要過
+    :func:`_e` —— 與本檔其他插值點同一條規則，不為它開特例。
+    """
+    return f"{STATUS_PATH}?msgid={_q(msgid, safe='')}"
+
+
+def _format_status_time(raw: str | None) -> str:
+    """把 ``20260729143730`` 排成 ``2026-07-29 14:37:30``。
+
+    格式不符時**原樣回傳**，不猜、不補零：這個欄位是給人拿去跟三竹後台對帳的，
+    自己重排過的時間對不上就是災難。
+    """
+    if raw is None:
+        return "（三竹未回傳）"
+    text = raw.strip()
+    if not text:
+        return "（三竹未回傳）"
+    # isascii() 是必要的：全形數字的 isdigit() 也是 True，切出來會是一串怪東西。
+    if len(text) == 14 and text.isascii() and text.isdigit():
+        return (
+            f"{text[0:4]}-{text[4:6]}-{text[6:8]} "
+            f"{text[8:10]}:{text[10:12]}:{text[12:14]}（台灣時間）"
+        )
+    return text
+
+
+# 分類 →（方塊樣式, 標題）。key 必須與 ``mitake.DELIVERY_*`` 的值完全一致。
+#
+# 這裡**刻意不 import mitake**：web/__init__.py 已說明本套件的匯入順序有其脆弱性
+# （repo root 是由 web.server 補進 sys.path 的），樣板層為了幾個字串常數去建立那條
+# 相依不划算。代價是兩邊各寫一份字串，所以另外用一支測試把兩邊釘在一起
+# （tests/test_web.py::test_status_tone_table_covers_every_mitake_category），
+# 任何一邊改了名字都會紅燈，不會靜默漂開。
+_STATUS_TONE: dict[str, tuple[str, str]] = {
+    "delivered": ("ok", "已送達手機"),
+    "pending": ("warn", "還沒送到手機（處理中）"),
+    "failed": ("error", "沒有送達（最終狀態）"),
+    "error": ("warn", "三竹系統異常，這次查不到結果"),
+    "account_error": ("error", "查詢沒有完成：帳號或連線位址設定有問題"),
+    "unknown": ("warn", "三竹回了無法辨識的狀態碼"),
+}
+
+# 每一頁結果都要出現的對照說明。這個功能存在的理由就是「已送達業者 ≠ 已送達手機」，
+# 所以這句話不做成可選項 —— 不論查出什麼狀態都印。
+_STATUS_LEGEND = (
+    '<p class="muted">三竹的「已送達業者」（狀態碼 1–3）只代表簡訊交給電信商了，'
+    "<strong>不代表</strong>對方收到；"
+    "只有「已送達手機」（狀態碼 4）才代表對方門號真的收到。</p>\n"
+)
+
+
 # --------------------------------------------------------------------------- #
 # 各頁面
 # --------------------------------------------------------------------------- #
@@ -245,6 +308,12 @@ def render_form(
     )
     parts.append('<button type="submit">下一步：確認內容</button>\n')
     parts.append("</form>\n")
+    # 查投遞狀態是唯讀、免費的操作，放在表單頁只是入口；真正有價值的入口在成功頁
+    # （那裡帶得到剛發那則的 msgid，見 render_sent）。
+    parts.append(
+        f'<p class="muted"><a href="{STATUS_PATH}">查詢先前發送的投遞狀態'
+        "（免費，不扣點）</a></p>\n"
+    )
 
     return _page(
         "三竹簡訊發送", "".join(parts), script=_SEGMENT_SCRIPT, script_nonce=script_nonce
@@ -300,6 +369,13 @@ def render_sent(
 
     刻意**不放任何送出按鈕**：使用者在成功頁上唯一該做的事是離開。
     多一個「再送一次」的捷徑，就多一個手滑扣點的機會。
+
+    但**有 msgid 時會多一個「查詢投遞狀態」的連結**（有 msgid 才給，沒有就不給一個
+    點下去必定查無結果的死連結）。這是整個投遞查詢功能最有價值的入口：
+    「三竹已接收」只代表三竹收下了，離「對方手機收到」還有一段電信商投遞。
+    在此之前，使用者在這一頁就沒有下文了，手機沒響時只能猜。
+    連結是 ``<a>`` 而不是按鈕或表單 —— 這一頁的規矩是「不放任何會送出東西的元件」，
+    而查詢是唯讀、免費的 GET，不破壞那條規矩。
     """
     parts = ["<h1>已送出</h1>\n"]
     parts.append(
@@ -312,6 +388,17 @@ def render_sent(
     if account_point is not None:
         parts.append(f"<dt>剩餘點數</dt><dd>{account_point}</dd>\n")
     parts.append("</dl>\n")
+    if msgid:
+        parts.append(
+            _box(
+                "warn",
+                "「三竹已接收」不等於「對方收到」",
+                "<p>上面代表三竹收下了這則簡訊，接下來還要經過電信商投遞才會到對方手機，"
+                "通常數秒到數分鐘。</p>\n"
+                f'<p><a href="{_e(status_query_url(msgid))}">'
+                "查詢這則的投遞狀態（免費、不扣點，可以重複查）</a></p>\n",
+            )
+        )
     if audit_ok:
         parts.append(
             '<p class="muted">msgid 是日後查證這封簡訊的唯一依據，建議一併記下。'
@@ -474,3 +561,136 @@ def render_notice(
         parts.append(_hidden_resend_form(resend_phone, resend_body, resend_label))
     parts.append(_back_link(back_text))
     return _page(title, "".join(parts))
+
+
+# --------------------------------------------------------------------------- #
+# 投遞狀態查詢（唯讀、免費、不扣點）
+# --------------------------------------------------------------------------- #
+
+
+def render_status_form(
+    *, msgid: str = "", error: str | None = None, notice: str | None = None
+) -> str:
+    """查詢表單頁（``GET /status``，沒帶 msgid 時）。
+
+    表單用 ``method="get"``：查詢是唯讀且冪等的，用 GET 才能讓結果頁的網址可以
+    收藏、可以重新整理、可以貼給別人 —— 而重新整理一個 POST 結果頁會跳出
+    「要重新送出表單嗎」，在這個專案裡那個對話框本身就是誤導（使用者已經被訓練成
+    「重送＝可能多扣點」）。查詢不花錢，不需要二階段確認。
+
+    這一頁**沒有任何 ``<script>``**，所以不收 nonce（見 ``web.server._csp_header``：
+    沒有腳本的頁面直接給 ``script-src 'none'``，比帶 nonce 更嚴）。
+    """
+    parts = ["<h1>查詢簡訊投遞狀態</h1>\n"]
+    parts.append(
+        '<p class="muted">用發送成功時拿到的 msgid 查這則簡訊到底有沒有到對方手機。'
+        "查詢是唯讀操作，免費、不扣點，可以重複查。</p>\n"
+    )
+
+    if error:
+        parts.append(_box("error", "查詢失敗", f"<p>{_e(error)}</p>\n"))
+    if notice:
+        parts.append(_box("warn", "提醒", f"<p>{_e(notice)}</p>\n"))
+
+    parts.append(
+        f'<form method="get" action="{STATUS_PATH}" accept-charset="UTF-8">\n'
+    )
+    parts.append('<label for="status-msgid">msgid</label>\n')
+    parts.append(
+        '<input type="tel" id="status-msgid" name="msgid" autocomplete="off" '
+        f'inputmode="numeric" placeholder="0315772761" value="{_e(msgid)}">\n'
+    )
+    parts.append('<button type="submit">查詢投遞狀態</button>\n')
+    parts.append("</form>\n")
+    parts.append(_STATUS_LEGEND)
+    parts.append(_back_link())
+
+    return _page("查詢簡訊投遞狀態", "".join(parts))
+
+
+def render_status_result(
+    *,
+    msgid: str,
+    statuscode: str,
+    description: str,
+    category: str,
+    status_time: str | None = None,
+    is_delivered: bool = False,
+    is_final: bool = False,
+) -> str:
+    """查詢結果頁。
+
+    **這一頁最重要的一件事：不可以讓「已送達業者」看起來像「已送達手機」。**
+    狀態碼 1–3 的中文說明就是「已送達業者」，單獨顯示這五個字，多數人會讀成
+    「送到了」。所以處理中的狀態一律附上「這不是最終狀態、對方不一定收到、稍後
+    可以再查」的白話說明，且整頁只有 ``is_delivered``（狀態碼 4）才用綠色的
+    成功樣式。
+
+    參數直接取自 :func:`mitake.parse_status_response` 的回傳欄位。
+    ``category`` 是字串（``mitake.DELIVERY_*`` 的值），對應表見 :data:`_STATUS_TONE`。
+    """
+    kind, heading = _STATUS_TONE.get(category, _STATUS_TONE["unknown"])
+
+    if is_delivered:
+        detail = (
+            "<p>三竹回報這則簡訊<strong>已經送達對方手機</strong>（狀態碼 4）。"
+            "這是最終狀態，不會再變。</p>\n"
+        )
+    elif category == "pending":
+        detail = (
+            f"<p>三竹目前回報「{_e(description)}」，也就是簡訊已經交給電信商，"
+            "<strong>但還沒有確認對方手機收到</strong>。</p>\n"
+            "<p><strong>這不是最終狀態。</strong>投遞通常在數秒到數分鐘內完成，"
+            "稍後回到這一頁重新查詢即可（查詢免費、不扣點）。</p>\n"
+        )
+    elif category == "failed":
+        detail = (
+            f"<p>三竹回報這則簡訊<strong>沒有送達</strong>：{_e(description)}。</p>\n"
+            "<p>這是最終狀態，再查也不會改變。已經扣掉的點數不會退回。"
+            "確認號碼與內容後，可以回表單重新發送（會再扣一次點）。</p>\n"
+        )
+    elif category == "error":
+        detail = (
+            f"<p>三竹回報系統層異常：{_e(description)}。</p>\n"
+            "<p>這不是這則簡訊的投遞結果，而是三竹那端暫時的狀況。"
+            "請稍後再查一次；若持續如此，請聯絡三竹。</p>\n"
+        )
+    elif category == "account_error":
+        detail = (
+            f"<p>三竹沒有去查這則簡訊，而是回報設定問題：{_e(description)}。</p>\n"
+            "<p>請先修正帳號設定或 IP 白名單，再回來查詢。</p>\n"
+        )
+    else:
+        detail = (
+            f"<p>三竹回了狀態碼「{_e(statuscode)}」，本工具尚未收錄它的意義。</p>\n"
+            "<p>在查明之前，<strong>請不要假設對方已經收到</strong>。"
+            "可以拿下方的 msgid 到三竹後台核對。</p>\n"
+        )
+
+    parts = ["<h1>投遞狀態</h1>\n", _box(kind, heading, detail)]
+
+    parts.append("<dl>\n")
+    parts.append(f'<dt>msgid</dt><dd><span class="msgid">{_e(msgid)}</span></dd>\n')
+    parts.append(f"<dt>狀態碼</dt><dd>{_e(statuscode)}</dd>\n")
+    parts.append(f"<dt>狀態說明</dt><dd>{_e(description)}</dd>\n")
+    parts.append(f"<dt>狀態時間</dt><dd>{_e(_format_status_time(status_time))}</dd>\n")
+    parts.append(
+        "<dt>是否最終狀態</dt><dd>{}</dd>\n".format(
+            "是（不會再變）" if is_final else "否（稍後再查可能會變）"
+        )
+    )
+    parts.append("</dl>\n")
+
+    if not is_final:
+        # 重查連結而不是自動刷新：自動刷新會在無人看著的分頁裡一直打三竹的 API。
+        parts.append(
+            f'<p><a href="{_e(status_query_url(msgid))}">重新查詢這則（免費、不扣點）</a></p>\n'
+        )
+
+    parts.append(_STATUS_LEGEND)
+    parts.append(
+        f'<p class="muted"><a href="{STATUS_PATH}">查詢另一則 msgid</a></p>\n'
+    )
+    parts.append(_back_link())
+
+    return _page("投遞狀態", "".join(parts))

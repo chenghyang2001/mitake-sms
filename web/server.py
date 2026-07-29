@@ -9,6 +9,7 @@
     GET  /          表單頁（即時試算則數與扣點）
     POST /preview   確認頁（顯示解析後號碼、則數、扣點，發一張一次性 token）
     POST /send      實際發送（必須帶有效 token，用完立刻作廢）
+    GET  /status    查投遞狀態（唯讀、免費、不扣點；帶 ?msgid= 才查，否則出表單）
     GET  /health    健康檢查（不需認證，只回服務活著與否）
 
 設計重點（每一條都對應一種真金白銀的失誤）：
@@ -87,13 +88,17 @@ __all__ = [
     "DEFAULT_HOST",
     "DEFAULT_PORT",
     "DEFAULT_RATE_LIMIT_SEGMENTS",
+    "DEFAULT_STATUS_QUERY_LIMIT",
     "DEFAULT_TOKEN_TTL_SECONDS",
+    "STATUS_QUERY_WINDOW_SECONDS",
     "PendingSend",
     "RateLimitExceededError",
     "RateLimiter",
     "RateSnapshot",
     "Response",
     "SmsWebApp",
+    "StatusQueryThrottle",
+    "StatusQueryThrottledError",
     "TokenExpiredError",
     "TokenStore",
     "TokenUnknownError",
@@ -125,6 +130,12 @@ DEFAULT_TOKEN_TTL_SECONDS = 600
 DEFAULT_RATE_LIMIT_SEGMENTS = 20
 RATE_LIMIT_WINDOW_SECONDS = 3600
 
+# 投遞狀態查詢的節流：每 5 分鐘 30 次。這是**完全獨立的另一組計數**，
+# 與上面的發送則數上限沒有任何往來（理由見 StatusQueryThrottle 的 docstring）。
+# 30 次 / 5 分鐘對人來說綽綽有餘（平均每 10 秒一次），但擋得住放著自動重整的分頁。
+DEFAULT_STATUS_QUERY_LIMIT = 30
+STATUS_QUERY_WINDOW_SECONDS = 300
+
 # 未使用的 token 上限。/preview 不消耗發送額度（它還沒花錢），所以有人不斷重整
 # 確認頁時 token 會一直累積；設個上限讓記憶體用量有界，滿了就淘汰最舊的。
 MAX_LIVE_TOKENS = 256
@@ -143,6 +154,7 @@ ENV_TOKEN_TTL = "MITAKE_WEB_TOKEN_TTL"
 ENV_MAX_SEGMENTS = "MITAKE_WEB_MAX_SEGMENTS"
 ENV_LOG_LEVEL = "MITAKE_WEB_LOG_LEVEL"
 ENV_REQUIRE_ACCESS_EMAIL = "MITAKE_WEB_REQUIRE_ACCESS_EMAIL"
+ENV_STATUS_QUERY_LIMIT = "MITAKE_WEB_STATUS_QUERY_LIMIT"
 
 # Cloudflare Access 通過認證後注入的身分標頭。**這個值可以被偽造**（真正可驗的是
 # Cf-Access-Jwt-Assertion 的簽章，但驗它要拉 JWKS＝破壞零外部依賴），
@@ -297,6 +309,95 @@ class RateLimiter:
             # 否則 _retry_after 會算出偏短的等待秒數，讓人白等一輪再撞一次上限。
             self._events.sort(key=lambda event: event[0])
             return True
+
+
+# --------------------------------------------------------------------------- #
+# 投遞狀態查詢的節流（與發送額度完全分離）
+# --------------------------------------------------------------------------- #
+
+
+class StatusQueryThrottledError(Exception):
+    """投遞狀態查得太頻繁。``retry_after`` 是還要等幾秒（``None`` 代表算不出來）。"""
+
+    def __init__(
+        self, message: str, *, used: int, limit: int, retry_after: float | None
+    ) -> None:
+        super().__init__(message)
+        self.used = used
+        self.limit = limit
+        self.retry_after = retry_after
+
+
+class StatusQueryThrottle:
+    """投遞狀態查詢的滑動視窗節流器（計「次數」）。
+
+    **刻意不重用** :class:`RateLimiter`。那個計的是**發送則數**，也就是真金白銀的
+    計費單位；兩者若共用一個計數器，查一次免費的狀態就會吃掉一則簡訊的預算 ——
+    使用者查了幾次投遞狀態，結果發不出簡訊，這是最不該有的耦合。反過來（發簡訊
+    吃掉查詢次數）一樣荒謬。所以這裡另開一個小類別，而不是傳一個 ``cost=0``
+    之類的旗標去污染那支已經在跑的程式。
+
+    那查詢既然免費，為什麼還要節流？因為它**每次都會對三竹發一個真實的 HTTP 請求**。
+    一個放著自動重整的分頁、或按住 F5 的人，就會讓我們的來源 IP 對三竹持續打點；
+    三竹若因此限流或封鎖這個 IP，**連發簡訊都會一起壞掉**（statuscode=k），
+    而那個帳號是與 App 團隊共用的。節流保的是發送能力，不是查詢的錢。
+
+    與 :class:`RateLimiter` 同樣用 monotonic 時鐘（NTP 往回調不會讓限制失效），
+    同樣自帶 :class:`threading.Lock`（``ThreadingHTTPServer`` 會併發呼叫）。
+    """
+
+    def __init__(
+        self,
+        limit: int = DEFAULT_STATUS_QUERY_LIMIT,
+        *,
+        window_seconds: int = STATUS_QUERY_WINDOW_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if limit < 1:
+            raise ValueError(f"查詢次數上限必須 >= 1，收到 {limit}")
+        if window_seconds < 1:
+            raise ValueError(f"視窗長度必須 >= 1 秒，收到 {window_seconds}")
+        self._limit = limit
+        self._window = window_seconds
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._hits: list[float] = []
+
+    @property
+    def limit(self) -> int:
+        return self._limit
+
+    @property
+    def window_seconds(self) -> int:
+        return self._window
+
+    @property
+    def used(self) -> int:
+        """目前視窗內已用掉的次數（測試與除錯用）。"""
+        with self._lock:
+            now = self._clock()
+            self._hits = [hit for hit in self._hits if now - hit < self._window]
+            return len(self._hits)
+
+    def acquire(self) -> None:
+        """佔用一次查詢額度；超過就丟 :class:`StatusQueryThrottledError`。
+
+        沒有 ``release``：與發送不同，查詢失敗也已經對三竹發過請求了，
+        而這裡要限的正是「對三竹發了幾次請求」。退還額度等於放行重試風暴。
+        """
+        with self._lock:
+            now = self._clock()
+            self._hits = [hit for hit in self._hits if now - hit < self._window]
+            if len(self._hits) >= self._limit:
+                retry_after = max(0.0, self._hits[0] + self._window - now)
+                raise StatusQueryThrottledError(
+                    f"最近 {self._window // 60} 分鐘內已查詢 {len(self._hits)} 次，"
+                    f"超過上限 {self._limit} 次。",
+                    used=len(self._hits),
+                    limit=self._limit,
+                    retry_after=retry_after,
+                )
+            self._hits.append(now)
 
 
 # --------------------------------------------------------------------------- #
@@ -600,6 +701,9 @@ class SmsWebApp:
 
     * ``sender``：預設 :func:`mitake.send_sms`，簽名為
       ``sender(phone, body, *, max_segments, timeout) -> dict``。
+    * ``status_query``：預設 :func:`mitake.query_message_status`，簽名為
+      ``status_query(msgid, *, timeout) -> dict``。唯讀、免費，但仍必須可注入 ——
+      測試絕不可以真的打三竹。
     * ``clock``：預設 :func:`time.monotonic`，同時餵給 token TTL 與速率視窗。
     * ``audit_log``：預設寫 ``logs/send-audit.jsonl``。
     """
@@ -608,11 +712,14 @@ class SmsWebApp:
         self,
         *,
         sender: Callable[..., dict[str, Any]] | None = None,
+        status_query: Callable[..., dict[str, Any]] | None = None,
         audit_log: AuditLog | None = None,
         token_store: TokenStore | None = None,
         rate_limiter: RateLimiter | None = None,
+        status_throttle: StatusQueryThrottle | None = None,
         max_segments: int = mitake.MAX_SEGMENTS_PER_SEND,
         rate_limit: int = DEFAULT_RATE_LIMIT_SEGMENTS,
+        status_query_limit: int = DEFAULT_STATUS_QUERY_LIMIT,
         token_ttl_seconds: float = DEFAULT_TOKEN_TTL_SECONDS,
         send_timeout: float = mitake.DEFAULT_TIMEOUT_SECONDS,
         clock: Callable[[], float] = time.monotonic,
@@ -622,6 +729,9 @@ class SmsWebApp:
         if max_segments < 1:
             raise ValueError(f"單次則數上限必須 >= 1，收到 {max_segments}")
         self._sender = sender if sender is not None else mitake.send_sms
+        self._status_query = (
+            status_query if status_query is not None else mitake.query_message_status
+        )
         self._audit = audit_log if audit_log is not None else AuditLog()
         self._tokens = (
             token_store
@@ -630,6 +740,12 @@ class SmsWebApp:
         )
         self._rate = (
             rate_limiter if rate_limiter is not None else RateLimiter(rate_limit, clock=clock)
+        )
+        # 與 self._rate 是兩個各自獨立的計數器，理由見 StatusQueryThrottle 的 docstring。
+        self._status_throttle = (
+            status_throttle
+            if status_throttle is not None
+            else StatusQueryThrottle(status_query_limit, clock=clock)
         )
         self._max_segments = int(max_segments)
         self._send_timeout = float(send_timeout)
@@ -665,6 +781,11 @@ class SmsWebApp:
     def rate_limiter(self) -> RateLimiter:
         return self._rate
 
+    @property
+    def status_throttle(self) -> StatusQueryThrottle:
+        """投遞狀態查詢的節流器。與 :attr:`rate_limiter`（發送則數）互不相干。"""
+        return self._status_throttle
+
     # -- 路由 ---------------------------------------------------------------- #
 
     def route(
@@ -673,6 +794,8 @@ class SmsWebApp:
         path: str,
         form: Mapping[str, Sequence[str]] | None = None,
         headers: Any = None,
+        *,
+        query: Mapping[str, Sequence[str]] | None = None,
     ) -> Response:
         """把 (method, path, form, headers) 對應到回應。HTTP 層只負責把參數餵進來。
 
@@ -680,6 +803,11 @@ class SmsWebApp:
         :class:`email.message.Message`，它的查找不分大小寫）。給 ``None`` 等同
         「沒有任何標頭」—— 在有設 ``require_access_email`` 時那會被擋下，
         這正是我們要的預設方向。
+
+        ``query`` 是網址上 ``?`` 之後的參數（``parse_qs`` 的形狀），**只給
+        ``GET /status`` 用**。它是後加的 keyword-only 參數，既有呼叫端
+        （含測試）不傳也完全不受影響。刻意與 ``form`` 分開：花錢的 ``/send``
+        只吃 POST body，永遠不該從網址列取值。
         """
         form = form if form is not None else {}
         # /health 在存取檢查**之前**處理：systemd / 監控探測不會帶 Access 標頭，
@@ -698,6 +826,12 @@ class SmsWebApp:
             return self.handle_preview(form) if method == "POST" else self._method_not_allowed()
         if path == "/send":
             return self.handle_send(form) if method == "POST" else self._method_not_allowed()
+        if path == templates.STATUS_PATH:
+            # 只收 GET：查詢是唯讀且冪等的，用 GET 才能收藏／重整／貼給別人，
+            # 也才能讓成功頁那個入口是一個純連結而不是一顆按鈕（見 render_sent）。
+            return (
+                self.handle_status(query) if method == "GET" else self._method_not_allowed()
+            )
         return self._not_found()
 
     def _deny_without_access_email(self, headers: Any) -> Response | None:
@@ -958,6 +1092,169 @@ class SmsWebApp:
             )
 
         return self._succeed(request_id, pending, result)
+
+    def handle_status(
+        self, query: Mapping[str, Sequence[str]] | None = None
+    ) -> Response:
+        """投遞狀態查詢（``GET /status``）。**唯讀、免費、不扣點。**
+
+        沒帶 ``msgid`` 就出查詢表單；帶了就查。這條路徑上任何一種失敗都不會扣點
+        （走的是 ``SmQuery`` 端點，見 :func:`mitake.query_message_status`），
+        所以每個錯誤頁都可以、也應該明講「沒有扣點」—— 這個服務的使用者已經被
+        訓練成看到「失敗」就擔心錢，別讓他們為一個免費操作提心吊膽。
+
+        **不需要 token。** 二階段確認存在的理由是「送出不可逆且花錢」，查詢兩者
+        皆非。但它仍在 :meth:`_deny_without_access_email` **之後**才被路由到，
+        設了 Access 檢查時一樣擋（見 :meth:`route`）。
+        """
+        raw_msgid = _first(query if query is not None else {}, "msgid")
+        if not raw_msgid.strip():
+            return _html_response(HTTPStatus.OK, templates.render_status_form())
+
+        try:
+            msgid = mitake.validate_msgid(raw_msgid)
+        except mitake.MitakeValidationError as exc:
+            # 回填使用者原本打的字串（樣板會 escape），讓他看得到自己哪裡打錯。
+            return _html_response(
+                HTTPStatus.BAD_REQUEST,
+                templates.render_status_form(
+                    msgid=raw_msgid, error=f"{exc}（沒有查詢，也沒有扣點）"
+                ),
+            )
+
+        # 節流放在驗證**之後**：格式就錯的輸入根本不會發出請求，不該吃掉額度。
+        try:
+            self._status_throttle.acquire()
+        except StatusQueryThrottledError as exc:
+            return _html_response(
+                HTTPStatus.TOO_MANY_REQUESTS,
+                templates.render_notice(
+                    title="查詢太頻繁",
+                    heading="查詢太頻繁",
+                    message=(
+                        f"{exc}查詢本身不扣點，這道限制是為了避免本機 IP 對三竹打點"
+                        "太密集而被限流 —— 那會連發簡訊一起壞掉。"
+                    ),
+                    hint=_format_wait(exc.retry_after),
+                ),
+            )
+
+        try:
+            status = self._status_query(msgid, timeout=self._send_timeout)
+        except mitake.MitakeValidationError as exc:
+            # 理論上 validate_msgid 已經擋掉了，但 status_query 是可注入的，
+            # 不能假設它的驗證規則和這裡一模一樣。
+            return _html_response(
+                HTTPStatus.BAD_REQUEST,
+                templates.render_status_form(
+                    msgid=raw_msgid, error=f"{exc}（沒有扣點）"
+                ),
+            )
+        except mitake.MitakeConfigError as exc:
+            return _html_response(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                templates.render_notice(
+                    title="設定不完整",
+                    heading="設定不完整，查不了",
+                    message=f"{exc}本次沒有查詢，也沒有扣點。",
+                    kind="error",
+                    hint=(
+                        "請檢查 /etc/mitake-sms.env 的 MITAKE_USERNAME / "
+                        "MITAKE_PASSWORD，改好後重啟 mitake-web 服務。"
+                    ),
+                ),
+            )
+        except mitake.MitakeAPIError as exc:
+            return self._status_api_error_response(exc)
+        except mitake.MitakeError as exc:
+            logger.error("查詢投遞狀態失敗（未分類的 MitakeError）：msgid=%s %s", msgid, exc)
+            return self._status_generic_error_response(str(exc))
+        except Exception:  # noqa: BLE001 — 同 handle_send：不讓單一請求的 bug 拖垮服務
+            # 只記在 log，不把 traceback 送到瀏覽器（可能含內部路徑）。
+            logger.exception("查詢投遞狀態時發生未預期錯誤：msgid=%s", msgid)
+            return self._status_generic_error_response(
+                "伺服器內部發生錯誤。詳細原因請看 journalctl -u mitake-web。"
+            )
+
+        return _html_response(
+            HTTPStatus.OK,
+            templates.render_status_result(
+                msgid=str(status.get("msgid") or msgid),
+                statuscode=str(status.get("statuscode") or ""),
+                description=str(status.get("description") or ""),
+                category=str(status.get("category") or mitake.DELIVERY_UNKNOWN),
+                status_time=(
+                    str(status["status_time"])
+                    if status.get("status_time") is not None
+                    else None
+                ),
+                # 用 is True 而不是 bool()：這兩個布林值決定畫面上寫「已送達手機」
+                # 還是「還沒到」，注入來源給了個真值字串（例如 "0"）也不該被當成已送達。
+                is_delivered=status.get("is_delivered") is True,
+                is_final=status.get("is_final") is True,
+            ),
+        )
+
+    def _status_api_error_response(self, exc: mitake.MitakeAPIError) -> Response:
+        """把查詢時的 :class:`mitake.MitakeAPIError` 分成「設定問題」與「暫時故障」。
+
+        兩者的處置完全不同：前者重查一百次也一樣失敗，要去改設定；後者稍後再查就好。
+        分流依據沿用發送路徑那套 ``kind``，不另外比對中文字串。
+        """
+        kind = str(getattr(exc, "kind", mitake.KIND_API))
+        if getattr(exc, "possibly_charged", False):
+            # SmQuery 是唯讀端點，這裡永遠不該為真。真的出現代表 mitake.py 那邊
+            # 有人把查詢改成走 SmSend 了 —— 那是會扣點的，必須看得見。
+            logger.error(
+                "查詢路徑上出現 possibly_charged=True，這代表查詢端點被改成會扣點的：%s",
+                exc,
+            )
+
+        if kind == mitake.KIND_IP_BLOCKED:
+            return _html_response(
+                HTTPStatus.BAD_GATEWAY,
+                templates.render_notice(
+                    title="查不到投遞狀態",
+                    heading="這台機器的 IP 不在三竹白名單，查不了（未扣點）",
+                    message=f"{exc}",
+                    kind="error",
+                    hint=(
+                        "這是設定問題不是暫時故障，重查不會成功。"
+                        "請寄 service@mitake.com.tw 申請把本機外網 IP 加入白名單。"
+                    ),
+                ),
+            )
+        if kind == mitake.KIND_AUTH_FAILED:
+            return _html_response(
+                HTTPStatus.BAD_GATEWAY,
+                templates.render_notice(
+                    title="查不到投遞狀態",
+                    heading="三竹帳號或密碼錯誤，查不了（未扣點）",
+                    message=f"{exc}",
+                    kind="error",
+                    hint=(
+                        "這是設定問題不是暫時故障，重查不會成功。"
+                        "請檢查 /etc/mitake-sms.env 的憑證，改好後重啟 mitake-web 服務。"
+                    ),
+                ),
+            )
+        return self._status_generic_error_response(str(exc))
+
+    def _status_generic_error_response(self, message: str) -> Response:
+        """查詢失敗但可以再試的統一畫面。**一定要講「沒有扣點」。**"""
+        return _html_response(
+            HTTPStatus.BAD_GATEWAY,
+            templates.render_notice(
+                title="查不到投遞狀態",
+                heading="查不到投遞狀態（未扣點）",
+                message=f"{message} 這次查詢沒有扣點，簡訊本身的狀態不受影響。",
+                kind="error",
+                hint=(
+                    "查詢是唯讀操作，稍後可以安全地再查一次。"
+                    "若一直查不到，請拿 msgid 到三竹後台核對。"
+                ),
+            ),
+        )
 
     def handle_health(self) -> Response:
         """健康檢查：只回「服務活著」，不查餘額、不碰憑證。
@@ -1356,11 +1653,19 @@ def make_handler(app: SmsWebApp) -> type[BaseHTTPRequestHandler]:
 
         def _dispatch(self, method: str) -> None:
             try:
-                path = urlparse(self.path).path
+                parts = urlparse(self.path)
+                path = parts.path
+                # 網址上的 query 只餵給 GET /status（唯讀查詢）。花錢的 /send 一律
+                # 只吃 POST body —— 不讓任何會扣點的東西從網址列取得參數。
+                query = (
+                    parse_qs(parts.query, keep_blank_values=True) if parts.query else {}
+                )
                 form = self._read_form() if method == "POST" else {}
                 # self.headers 是 email.message.Message，.get() 不分大小寫 ——
                 # 標頭名稱的大小寫由對方決定，不能自己用 dict 查。
-                response = self._app.route(method, path, form, headers=self.headers)
+                response = self._app.route(
+                    method, path, form, headers=self.headers, query=query
+                )
             except _RequestError as exc:
                 response = _html_response(
                     exc.status,
@@ -1509,6 +1814,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=f"每小時可送出的則數上限（預設 {DEFAULT_RATE_LIMIT_SEGMENTS}）",
     )
     parser.add_argument(
+        "--status-query-limit",
+        type=int,
+        default=_env_int(ENV_STATUS_QUERY_LIMIT, DEFAULT_STATUS_QUERY_LIMIT),
+        help=(
+            f"每 {STATUS_QUERY_WINDOW_SECONDS // 60} 分鐘可查詢投遞狀態的次數上限"
+            f"（預設 {DEFAULT_STATUS_QUERY_LIMIT}）。查詢不扣點，此限制是為了避免"
+            "本機 IP 對三竹打點太密集而被限流。"
+        ),
+    )
+    parser.add_argument(
         "--token-ttl",
         type=int,
         default=_env_int(ENV_TOKEN_TTL, DEFAULT_TOKEN_TTL_SECONDS),
@@ -1587,6 +1902,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     for name, value, minimum in (
         ("--max-segments", args.max_segments, 1),
         ("--rate-limit", args.rate_limit, 1),
+        ("--status-query-limit", args.status_query_limit, 1),
         ("--token-ttl", args.token_ttl, 1),
     ):
         if value < minimum:
@@ -1600,15 +1916,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         audit_log=AuditLog(args.audit_path) if args.audit_path else None,
         max_segments=args.max_segments,
         rate_limit=args.rate_limit,
+        status_query_limit=args.status_query_limit,
         token_ttl_seconds=args.token_ttl,
         require_access_email=args.require_access_email,
     )
 
     logger.info(
-        "設定：單次上限 %s 則、每小時上限 %s 則、確認頁 %s 秒、稽核檔 %s",
+        "設定：單次上限 %s 則、每小時上限 %s 則、確認頁 %s 秒、"
+        "投遞狀態查詢上限 %s 次／%s 秒、稽核檔 %s",
         app.max_segments,
         args.rate_limit,
         args.token_ttl,
+        args.status_query_limit,
+        STATUS_QUERY_WINDOW_SECONDS,
         app.audit_path,
     )
 
