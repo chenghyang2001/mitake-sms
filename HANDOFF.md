@@ -7,7 +7,13 @@
 
 ---
 
-## 1. 目前狀態（第一部分已完成 ✅）
+## 1. 目前狀態：三個部分全數上線 ✅
+
+| 部分 | 內容 | 狀態 |
+| ------ | ------ | ------ |
+| 第一 | 核心模組 + VPS 部署 + 驗收 | ✅ 上線（見本節） |
+| 第二 | 餘額告警排程 | ✅ 上線，每日 08:00（見 §5） |
+| 第三 | Web 發送介面 | ✅ 上線 <https://sms.chenghyang.uk>（見 §6） |
 
 | 項目 | 值 |
 | ------ | ----- |
@@ -134,7 +140,74 @@ python3.12 -c "import mitake; print('餘額點數:', mitake.query_balance())"
 
 </details>
 
-## 6. 第三部分：Web 發送介面
+## 6. 第三部分：Web 發送介面 ✅ 已完成上線（2026-07-29）
+
+| 項目 | 值 |
+| ------ | ------ |
+| 網址 | **<https://sms.chenghyang.uk>** |
+| 程式 | 本 repo `web/`（server / templates / audit）＋ `deploy/mitake-web.service` |
+| 服務 | `mitake-web.service`（VPS，綁 **127.0.0.1:8766**，不直接對外） |
+| 對外 | Cloudflare Tunnel `vps-webhook` → ingress `sms.chenghyang.uk` → `localhost:8766` |
+| 稽核 | `/var/log/mitake-sms/send-audit.jsonl`（**含收件號碼，已 gitignore，勿進版控**） |
+| 驗收 | 2026-07-29 實發 1 則，msgid `0315772761`，三竹查詢狀態碼 `4`（已送達手機） |
+
+### 6.1 兩層存取保護（缺一不可）
+
+1. **Cloudflare Zero Trust Access**（外層，真正的認證）
+   - application `mitake-web` / domain `sms.chenghyang.uk` / session 24h
+   - policy `only-me`：Allow → Emails → `chenghyang2001@gmail.com`
+   - 未登入者被導向 `chenghyang.cloudflareaccess.com` 登入頁，**碰不到服務**
+2. **應用層 header 檢查**（內層，`MITAKE_WEB_REQUIRE_ACCESS_EMAIL`，unit 檔已啟用）
+   - 檢查 `Cf-Access-Authenticated-User-Email` 是否相符，不符回 403；`/health` 豁免
+   - ⚠️ **這不是真正的認證**（header 可偽造）。它改變的是**失敗模式**：「Access 忘了設／設錯／先開 tunnel 才去設」原本會安靜地變成一個對全世界開放的付費簡訊閘道，加了之後會變成一眼看得見的 403。**壞掉會有人回報，安靜被利用不會。**
+
+**若整站 403 而 `/health` 仍 200**，看 journal 判讀（log 刻意不印 header 原值，避免 log injection）：
+
+| log 訊息 | 意義 |
+| ------ | ------ |
+| 「標頭**缺少**」 | CF 送的 header 不叫這個名字 → 改 `ACCESS_EMAIL_HEADER` |
+| 「標頭**與設定值不符**」 | 名稱對、email 值不同 → 對齊 unit 檔的設定值 |
+
+回滾：把 unit 檔那行改回註解 → `daemon-reload` → `restart`（約一分鐘）。
+
+### 6.2 常用運維指令
+
+```bash
+ssh claude@187.127.109.145
+systemctl status mitake-web
+sudo journalctl -u mitake-web -n 50 --no-pager
+sudo cat /var/log/mitake-sms/send-audit.jsonl | tail -5   # 號碼已遮罩、內容不落地
+
+# 改完程式後重新部署
+cd ~/mitake-sms && git pull
+sudo cp deploy/mitake-web.service /etc/systemd/system/ && sudo systemctl daemon-reload
+sudo systemctl restart mitake-web
+```
+
+### 6.3 動 tunnel 設定前必讀
+
+`~/.cloudflared/config.yml` 是**所有** tunnel 服務共用的單一檔案（`vps` / `prompts` / `mcp` / `langgraph` / `ch25` / `linebot` / `sms`）。改它之前：
+
+```bash
+cp ~/.cloudflared/config.yml ~/.cloudflared/config.yml.bak-$(date +%Y%m%d)
+# 新 ingress 必須插在 catch-all「- service: http_status:404」之前
+cloudflared tunnel ingress validate     # 不可省略
+sudo systemctl restart cloudflared      # 不支援 reload
+# 改完回頭驗既有 hostname 還活著（tunnel 壞會是 530/1033 或連不上；404/502 是後端自己的狀態）
+```
+
+⚠️ **改共用設定檔前先量 baseline**（2026-07-29 的疏失）：當時沒先記錄既有 hostname 的狀態碼，事後看到 `prompts` 404、`mcp` 502 只能從「錯誤碼性質」推論不是自己造成的。推論成立，但先量就是直接比對。
+
+### 6.4 已知限制與待辦
+
+- **`possibly_charged` 只存在於 `MitakeAPIError`** —— Web 層已用 `getattr(..., True)` 保守處理，但 `MitakeError` 基底補一個 class-level `possibly_charged = False` 會更乾淨（見 §2.1）
+- 純 ASCII 內容的則數會**高估**（一律 70 字/則，三竹對純英數通常 160 字/則）。方向保守不會少扣，但確認頁的數字會偏多
+- 稽核檔目前無 logrotate。日後若加，注意速率回填是從稽核檔 tail 讀的，輪替當下該小時額度會重置
+
+---
+
+<details>
+<summary>原始建議架構（2026-07-29 前一 session 的評估，保留供對照）</summary>
 
 **需求**：網頁輸入手機號碼 + 訊息內容 → 呼叫 `send_sms` 發送。
 
@@ -146,6 +219,10 @@ python3.12 -c "import mitake; print('餘額點數:', mitake.query_balance())"
 - 🔴 **必加認證再上線**：發簡訊直接燒共用點數池。建議 Cloudflare Zero Trust Access 限定 `chenghyang2001@gmail.com`（比 ch21/ch25 的「無 auth 待補」教訓更不能重蹈）。上線順序：先只綁 localhost 測通 → 加 CF Access → 才開 tunnel ingress
 - systemd unit（如 `mitake-web.service`）：`ExecStart=/usr/bin/python3.12 ...`、`EnvironmentFile=/etc/mitake-sms.env`、`User=claude`、`Restart=always`
 - 防呆建議：確認頁（顯示則數與扣點數）、單次發送則數上限、發送 log 留底（誰在何時發了什麼）
+
+（上述建議全數採用，實際配置與運維見 §6.1–6.4。）
+
+</details>
 
 ## 7. 開工前 checklist（新 session 第一步）
 
