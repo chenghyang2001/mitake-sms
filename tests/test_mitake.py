@@ -43,19 +43,51 @@ class _NetworkReached(Exception):
 
 
 class _FakeResponse:
-    """最小可用的 ``_OPENER.open`` 回傳替身（需支援 context manager 與 read）。"""
+    """最小可用的 ``_OPENER.open`` 回傳替身（需支援 context manager 與 read）。
+
+    **有狀態**：`read(n)` 會從目前位置往後給、讀完回 `b""`，和真的
+    `http.client.HTTPResponse` 一樣。這不是為了好看 —— `mitake._read_capped`
+    是「一直讀到回空為止」的迴圈，若替身每次都把整段 payload 再給一次，迴圈永遠
+    讀不到結尾，測試會拿到一段被重複串接的假資料（而且看起來很像成功）。
+
+    `amt=None` 代表「全部讀完」，與標準檔案物件語意一致。
+    """
 
     def __init__(self, payload: bytes) -> None:
         self._payload = payload
+        self._pos = 0
 
-    def read(self) -> bytes:
-        return self._payload
+    def read(self, amt: int | None = None) -> bytes:
+        if amt is None:
+            chunk = self._payload[self._pos :]
+        else:
+            chunk = self._payload[self._pos : self._pos + max(0, amt)]
+        self._pos += len(chunk)
+        return chunk
 
     def __enter__(self) -> "_FakeResponse":
         return self
 
     def __exit__(self, *exc_info: object) -> bool:
         return False
+
+
+class _ShortReadResponse(_FakeResponse):
+    """每次 `read()` 最多只給 `chunk_size` 個位元組的替身。
+
+    存在的理由：`read(n)` 的契約是「**最多** n 個位元組」。若 `_read_capped` 寫成
+    單次 `read(limit)` 就收工，遇到會短讀的檔案物件時會**靜默截斷**回應 ——
+    而截斷後的 `AccountPoi` 會被解析成「查不到餘額」，正是每天 08:00 那個餘額
+    告警排程最不該收到的假訊號（它會發出一則不存在的低點數警報）。
+    """
+
+    def __init__(self, payload: bytes, *, chunk_size: int = 3) -> None:
+        super().__init__(payload)
+        self._chunk_size = chunk_size
+
+    def read(self, amt: int | None = None) -> bytes:
+        limit = self._chunk_size if amt is None else min(amt, self._chunk_size)
+        return super().read(limit)
 
 
 def _use_fake_credentials(monkeypatch):
@@ -519,4 +551,378 @@ def test_query_message_status_wraps_unparseable_response(monkeypatch):
 
     with pytest.raises(mitake.MitakeAPIError) as excinfo:
         mitake.query_message_status("0315772761")
+    assert excinfo.value.possibly_charged is False
+
+
+# --------------------------------------------------------------------------- #
+# 身分驗證：三竹回的必須是「你問的那則」
+# --------------------------------------------------------------------------- #
+#
+# 這一段鎖的是 mitake.py 區段鐵律的第二半（第一半「格式異常拋錯」在上面）。
+# 第一版把身分不符寫成 logger.warning 就放行，實測後果：查 0315772761、三竹回
+# 9999999999，畫面整頁綠色「已送達手機」，而使用者查的 msgid 一個字都沒出現。
+# 反向更貴：那則其實已送達、畫面卻說「沒送到可以重發」→ 多扣一點 + 對方收到兩封。
+
+FOREIGN_MSGID = "9999999999"
+QUERIED_MSGID = "0315772761"
+
+
+def test_foreign_msgid_is_rejected_instead_of_shown_as_this_messages_status(monkeypatch):
+    """**MUST_FIX 的主鎖**：三竹回別則簡訊的狀態時必須拋錯，不可回傳。
+
+    刻意用 statuscode=4（已送達手機）當樣本 —— 那是最貴的誤報：畫面會用綠色的
+    成功樣式說「對方已收到」，使用者於是不再追，而他真正問的那則可能根本沒送到。
+    """
+    _use_fake_credentials(monkeypatch)
+    _fake_status_opener(
+        monkeypatch, f"{FOREIGN_MSGID}\t4\t20260729143730\r\n".encode("big5")
+    )
+
+    with pytest.raises(mitake.MitakeAPIError) as excinfo:
+        mitake.query_message_status(QUERIED_MSGID)
+
+    assert excinfo.value.kind == mitake.KIND_MSGID_MISMATCH
+    # 查詢走唯讀免費的 SmQuery，從來不扣點。寫成 True 會讓畫面說「請勿重送」，
+    # 而重查一次根本沒有代價。
+    assert excinfo.value.possibly_charged is False
+
+
+def test_foreign_msgid_never_produces_a_delivered_result(monkeypatch):
+    """反向釘死：那條路徑上**不可能**產出 is_delivered=True 的回傳值。
+
+    與上一支的差別在斷言對象：上一支驗「有拋錯」，這支驗「沒有任何結果溜出來」。
+    若日後有人把 raise 改回 warning，這裡的 result 會被指派，斷言就抓得到。
+    """
+    _use_fake_credentials(monkeypatch)
+    _fake_status_opener(
+        monkeypatch, f"{FOREIGN_MSGID}\t4\t20260729143730\r\n".encode("big5")
+    )
+
+    result = "沒有回傳值"
+    try:
+        result = mitake.query_message_status(QUERIED_MSGID)
+    except mitake.MitakeAPIError:
+        pass
+
+    assert result == "沒有回傳值"
+
+
+def test_mismatch_error_names_both_msgids(monkeypatch):
+    """錯誤訊息必須**同時**帶查詢的與回傳的 msgid。
+
+    只講一個等於沒講：使用者無從判斷「這是我那則嗎」。兩個數字並排放，
+    他一眼就看得出不是自己那則，也才知道要拿哪個號碼去三竹後台核對。
+    """
+    _use_fake_credentials(monkeypatch)
+    _fake_status_opener(
+        monkeypatch, f"{FOREIGN_MSGID}\t4\t20260729143730\r\n".encode("big5")
+    )
+
+    with pytest.raises(mitake.MitakeAPIError) as excinfo:
+        mitake.query_message_status(QUERIED_MSGID)
+
+    message = str(excinfo.value)
+    assert QUERIED_MSGID in message
+    assert FOREIGN_MSGID in message
+
+
+@pytest.mark.parametrize("code", ["0", "1", "4", "6", "8", "*", "Z"])
+def test_mismatch_is_rejected_regardless_of_the_status_code(monkeypatch, code: str):
+    """身分不符時，**不論那則的狀態碼是什麼**都要拒絕。
+
+    包含 ``*``（系統錯誤）與 ``Z``（未知碼）—— 那兩種在 msgid 相符時是照常回傳的，
+    所以這裡確認拒絕的理由是「身分」而不是「狀態」。
+    帳戶類的碼（k/e…）不在此列：它們在更前面就以設定問題拋出了，是另一條路徑。
+    """
+    _use_fake_credentials(monkeypatch)
+    _fake_status_opener(
+        monkeypatch, f"{FOREIGN_MSGID}\t{code}\t20260729143730\r\n".encode("big5")
+    )
+
+    with pytest.raises(mitake.MitakeAPIError) as excinfo:
+        mitake.query_message_status(QUERIED_MSGID)
+    assert excinfo.value.kind == mitake.KIND_MSGID_MISMATCH
+
+
+def test_multiline_response_with_a_foreign_first_line_is_rejected(monkeypatch):
+    """多行回應且第一行是別則 —— 不可靜默取第一行當答案。
+
+    parse_status_response 只讀第一個非空行。若身分不檢查，這種回應會讓畫面顯示
+    第一行那則的狀態，而使用者問的那則（第二行）明明就在同一份回應裡。
+    """
+    _use_fake_credentials(monkeypatch)
+    _fake_status_opener(
+        monkeypatch,
+        (
+            f"{FOREIGN_MSGID}\t8\t20260729143730\r\n"
+            f"{QUERIED_MSGID}\t4\t20260729143731\r\n"
+        ).encode("big5"),
+    )
+
+    with pytest.raises(mitake.MitakeAPIError) as excinfo:
+        mitake.query_message_status(QUERIED_MSGID)
+    assert excinfo.value.kind == mitake.KIND_MSGID_MISMATCH
+
+
+def test_matching_msgid_path_is_unchanged(monkeypatch):
+    """回歸：msgid 相符時一切照舊 —— 身分檢查不可波及正常路徑。"""
+    _use_fake_credentials(monkeypatch)
+    _fake_status_opener(monkeypatch, STATUS_DELIVERED_RESPONSE.encode("big5"))
+
+    status = mitake.query_message_status(QUERIED_MSGID)
+
+    assert status["msgid"] == QUERIED_MSGID
+    assert status["statuscode"] == "4"
+    assert status["is_delivered"] is True
+    assert status["is_final"] is True
+
+
+def test_surrounding_whitespace_in_the_query_is_not_a_mismatch(monkeypatch):
+    """Edge case：使用者貼上時多了空白，正規化後相符就不算身分不符。
+
+    validate_msgid 會去掉前後空白，比對用的必須是正規化後的值 —— 拿原始輸入去比，
+    每個複製貼上的人都會撞到一個「三竹回了別則簡訊」的假警報。
+    """
+    _use_fake_credentials(monkeypatch)
+    _fake_status_opener(monkeypatch, STATUS_DELIVERED_RESPONSE.encode("big5"))
+
+    status = mitake.query_message_status(f"  {QUERIED_MSGID}  ")
+
+    assert status["msgid"] == QUERIED_MSGID
+    assert status["is_delivered"] is True
+
+
+# --------------------------------------------------------------------------- #
+# 回應大小上限（_fetch_raw）—— 最需要小心的回歸面
+# --------------------------------------------------------------------------- #
+#
+# _fetch_raw 是 query_balance / send_sms / query_message_status 三者共用的底層，
+# 而 query_balance 每天 08:00 被 n8n2vps-hub 的餘額告警排程呼叫。加上限的前提是
+# 「正常大小的回應逐位元組不變」，故這一段的回歸鎖比新行為的鎖還多。
+
+
+def _fake_opener_with(monkeypatch, response_factory):
+    """把 ``_OPENER.open`` 換成「每次呼叫都產生一個新 response 物件」的替身。
+
+    每次都新建是必要的：response 有讀取位置，共用同一個物件的話第二次呼叫會從
+    上次讀完的位置繼續，拿到空回應。
+    """
+    monkeypatch.setattr(mitake._OPENER, "open", lambda *a, **k: response_factory())
+
+
+@pytest.mark.parametrize(
+    "size",
+    [0, 1, 19, 1024, mitake.MAX_RESPONSE_BYTES - 1, mitake.MAX_RESPONSE_BYTES],
+)
+def test_response_at_or_under_the_cap_is_returned_byte_for_byte(monkeypatch, size: int):
+    """**最重要的回歸鎖**：沒超過上限的回應，拿到的位元組必須與加上限之前完全相同。
+
+    含邊界值 MAX_RESPONSE_BYTES 本身（剛好等於上限＝仍然合法）。少一個位元組、
+    多一個位元組都算失敗 —— 靜默截斷的回應解析出來會是「查不到餘額」，
+    而那個排程收到的會是一則不存在的低點數警報。
+    """
+    _use_fake_credentials(monkeypatch)
+    payload = b"A" * size
+    _fake_opener_with(monkeypatch, lambda: _FakeResponse(payload))
+
+    assert mitake._fetch_raw(mitake.ENDPOINT_QUERY, {}, 5.0) == payload
+
+
+def test_read_capped_reassembles_short_reads():
+    """``read(n)`` 允許短讀，``_read_capped`` 必須把碎片拼回完整內容。
+
+    單次 ``read(limit)`` 的寫法在這裡只會拿到前 3 個位元組，
+    而那正是「靜默截斷」這個最壞情況的縮影。
+    """
+    payload = "AccountPoint=12571\r\n".encode("big5")
+    assert (
+        mitake._read_capped(_ShortReadResponse(payload, chunk_size=3), 65_537) == payload
+    )
+
+
+def test_query_balance_still_works_through_the_capped_reader(monkeypatch):
+    """整合回歸：每天 08:00 那條路徑（query_balance）必須完全不受影響。"""
+    _use_fake_credentials(monkeypatch)
+    _fake_opener_with(
+        monkeypatch, lambda: _FakeResponse("AccountPoint=12571\r\n".encode("big5"))
+    )
+
+    assert mitake.query_balance() == 12571
+
+
+def test_query_balance_survives_a_short_reading_connection(monkeypatch):
+    """整合回歸（短讀版）：連線一次只給幾個位元組時，餘額仍要正確讀出來。"""
+    _use_fake_credentials(monkeypatch)
+    _fake_opener_with(
+        monkeypatch,
+        lambda: _ShortReadResponse(
+            "AccountPoint=12571\r\n".encode("big5"), chunk_size=4
+        ),
+    )
+
+    assert mitake.query_balance() == 12571
+
+
+def test_oversized_response_is_rejected_not_truncated(monkeypatch):
+    """超過上限就拋錯，**不截斷後照常解析**。
+
+    截頭去尾的一大坨 HTML（代理器錯誤頁、DNS 被劫持）解出來的任何「狀態」
+    都是憑空捏造的，而畫面會把它當成三竹說的顯示出去。
+    """
+    _use_fake_credentials(monkeypatch)
+    oversized = b"<html>" + b"x" * mitake.MAX_RESPONSE_BYTES
+    _fake_opener_with(monkeypatch, lambda: _FakeResponse(oversized))
+
+    with pytest.raises(mitake.MitakeAPIError) as excinfo:
+        mitake._fetch_raw(mitake.ENDPOINT_QUERY, {}, 5.0)
+
+    assert excinfo.value.kind == mitake.KIND_BAD_RESPONSE
+    assert excinfo.value.possibly_charged is False  # 唯讀查詢，沒扣點
+
+
+def test_oversized_response_error_message_stays_small(monkeypatch):
+    """錯誤訊息本身不可以變成新的問題：20 萬字的回應不該產生 20 萬字的錯誤頁。"""
+    _use_fake_credentials(monkeypatch)
+    _fake_opener_with(monkeypatch, lambda: _FakeResponse(b"x" * 200_000))
+
+    with pytest.raises(mitake.MitakeAPIError) as excinfo:
+        mitake._fetch_raw(mitake.ENDPOINT_QUERY, {}, 5.0)
+
+    assert len(str(excinfo.value)) < 500
+
+
+def test_oversized_response_on_the_send_path_is_flagged_possibly_charged(monkeypatch):
+    """發送路徑上拿到超大回應 ＝ 請求已送達三竹但看不懂回應 → 別重送。
+
+    與查詢路徑刻意不同調：查詢免費（possibly_charged=False、可安全重查），
+    發送已經花了錢（True、要去後台以 msgid 查證）。搞反任一邊都會讓人多扣一次點。
+    """
+    _use_fake_credentials(monkeypatch)
+    _fake_opener_with(monkeypatch, lambda: _FakeResponse(b"x" * 200_000))
+
+    with pytest.raises(mitake.MitakeAPIError) as excinfo:
+        mitake._fetch_raw(mitake.ENDPOINT_SEND, {}, 5.0)
+
+    assert excinfo.value.possibly_charged is True
+    assert excinfo.value.kind == mitake.KIND_UNCONFIRMED
+
+
+def test_max_response_bytes_is_64_kib():
+    """上限值本身釘死：改動它等於改動所有三竹回應的接受範圍，要有人明確決定。"""
+    assert mitake.MAX_RESPONSE_BYTES == 64 * 1024
+
+
+def test_long_unparseable_response_is_truncated_in_the_error_message():
+    """解析失敗時，錯誤訊息裡的回應原文要截斷並明講「已截斷」。
+
+    不講的話，看到訊息的人會以為三竹只回了那 200 個字，往錯的方向排查。
+    """
+    text = "x" * 5_000
+
+    with pytest.raises(mitake.MitakeAPIError) as excinfo:
+        mitake.parse_status_response(text)
+
+    message = str(excinfo.value)
+    assert "已截斷" in message
+    assert "5000" in message  # 原文長度要講出來
+    assert len(message) < 500
+
+
+def test_short_unparseable_response_is_shown_verbatim():
+    """回歸：短回應的錯誤訊息一字不改 —— 截斷邏輯不可波及正常大小的診斷資訊。"""
+    with pytest.raises(mitake.MitakeAPIError) as excinfo:
+        mitake.parse_status_response("???")
+
+    message = str(excinfo.value)
+    assert "'???'" in message
+    assert "已截斷" not in message
+
+
+# --------------------------------------------------------------------------- #
+# 狀態碼大小寫正規化
+# --------------------------------------------------------------------------- #
+#
+# 實測 `K` 會落到「無法辨識的狀態碼」，把「IP 不在白名單」這個純設定問題講成
+# 「這則簡訊狀態不明」—— 使用者去追一則根本沒問題的簡訊，而該做的事（寄信給三竹）
+# 沒人去做。方向雖保守（畫面仍寫「請不要假設對方已經收到」），但誤導成本是實的。
+
+
+@pytest.mark.parametrize(
+    ("upper", "lower"), [("K", "k"), ("E", "e"), ("A", "a"), ("V", "v"), ("T", "t")]
+)
+def test_uppercase_status_codes_map_to_the_same_meaning(upper: str, lower: str):
+    """大寫變體查表結果必須與小寫完全相同（說明與分類都是）。"""
+    assert mitake.describe_delivery_status(upper) == mitake.describe_delivery_status(
+        lower
+    )
+
+
+def test_status_code_normalization_does_not_invent_meanings():
+    """回歸：正規化只接住大小寫變體，**不會**把真的未知碼猜成某個已知碼。"""
+    assert mitake.describe_delivery_status("Z")[1] == mitake.DELIVERY_UNKNOWN
+    assert mitake.describe_delivery_status("zz")[1] == mitake.DELIVERY_UNKNOWN
+    assert mitake.describe_delivery_status(None)[1] == mitake.DELIVERY_UNKNOWN
+
+
+def test_original_statuscode_is_never_rewritten_by_normalization():
+    """**正規化只用於查表**：回傳給呼叫端的 statuscode 必須是三竹回的原值。
+
+    改寫了的話，日後想核對「三竹到底回了什麼」會核對到我們自己改過的版本，
+    log 與稽核就失去了對帳能力。
+    """
+    parsed = mitake.parse_status_response(f"{QUERIED_MSGID}\tK\t20260729143730")
+
+    assert parsed["statuscode"] == "K"  # 原值，不是 "k"
+    assert parsed["category"] == mitake.DELIVERY_ACCOUNT_ERROR
+    assert parsed["description"] == "無效的連線位址"
+    assert parsed["is_delivered"] is False
+
+
+@pytest.mark.parametrize(
+    ("code", "expected_kind"),
+    [
+        ("k", mitake.KIND_IP_BLOCKED),
+        ("K", mitake.KIND_IP_BLOCKED),
+        ("e", mitake.KIND_AUTH_FAILED),
+        ("E", mitake.KIND_AUTH_FAILED),
+        ("1", mitake.KIND_API),
+        ("z", mitake.KIND_API),
+        (None, mitake.KIND_API),
+    ],
+)
+def test_classify_statuscode_normalizes_too(code, expected_kind: str):
+    """classify_statuscode 必須與 describe_delivery_status 同步正規化。
+
+    只修其中一邊會製造新的矛盾：``K`` 被 describe 判成「帳戶設定問題」而拋例外，
+    kind 卻是 api → 畫面顯示的是「稍後再查」的一般錯誤頁，而不是「去申請 IP
+    白名單」那頁。使用者照著重查一百次也不會成功。
+    """
+    assert mitake.classify_statuscode(code) == expected_kind
+
+
+def test_uppercase_account_error_reaches_the_ip_blocked_branch(monkeypatch):
+    """整合：Tab 格式裡的大寫 ``K`` 要一路走到 ip_blocked，畫面才會導向申請白名單。"""
+    _use_fake_credentials(monkeypatch)
+    _fake_status_opener(
+        monkeypatch, f"{QUERIED_MSGID}\tK\t20260729143730\r\n".encode("big5")
+    )
+
+    with pytest.raises(mitake.MitakeAPIError) as excinfo:
+        mitake.query_message_status(QUERIED_MSGID)
+
+    assert excinfo.value.is_ip_blocked is True
+    assert excinfo.value.possibly_charged is False
+    assert excinfo.value.statuscode == "K"  # 原值仍保留給稽核
+
+
+@pytest.mark.parametrize("text", ["", "0315772761", "AccountPoint=12571\r\n"])
+def test_format_errors_are_bad_response_not_generic_api(text: str):
+    """格式解不開屬於 bad_response（重試無用），不是可重試的一般 api 錯誤。
+
+    kind 決定畫面文案：講成可重試，使用者會反覆重整到放棄，
+    而「拿 msgid 去三竹後台核對」這句真正的出路一直沒被講清楚。
+    """
+    with pytest.raises(mitake.MitakeAPIError) as excinfo:
+        mitake.parse_status_response(text)
+    assert excinfo.value.kind == mitake.KIND_BAD_RESPONSE
     assert excinfo.value.possibly_charged is False

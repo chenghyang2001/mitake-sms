@@ -1196,9 +1196,23 @@ class SmsWebApp:
         )
 
     def _status_api_error_response(self, exc: mitake.MitakeAPIError) -> Response:
-        """把查詢時的 :class:`mitake.MitakeAPIError` 分成「設定問題」與「暫時故障」。
+        """把查詢時的 :class:`mitake.MitakeAPIError` 分成四種畫面。
 
-        兩者的處置完全不同：前者重查一百次也一樣失敗，要去改設定；後者稍後再查就好。
+        分類的唯一用途是**告訴使用者下一步該做什麼**，四種答案彼此互斥：
+
+        =========================  ==========================================
+        kind                       下一步
+        =========================  ==========================================
+        ``ip_blocked``             寄信給三竹加白名單（重查沒用）
+        ``auth_failed``            改 ``/etc/mitake-sms.env``（重查沒用）
+        ``msgid_mismatch``         拿 msgid 去三竹後台核對（重查沒用）
+        ``bad_response``           同上，回應解不開（重查沒用）
+        其餘（``network`` 等）      稍後再查一次（**只有這種**重查才有意義）
+        =========================  ==========================================
+
+        「重查沒用」的四種若共用「稍後再查」的文案，使用者會照做、會失敗、會再照做 ——
+        那句話把他釘在一個永遠不會成功的迴圈裡，而真正該做的事一個字都沒說。
+
         分流依據沿用發送路徑那套 ``kind``，不另外比對中文字串。
         """
         kind = str(getattr(exc, "kind", mitake.KIND_API))
@@ -1238,10 +1252,59 @@ class SmsWebApp:
                     ),
                 ),
             )
+        if kind == mitake.KIND_MSGID_MISMATCH:
+            # 三竹回的是別則簡訊的狀態。exc 的訊息已經同時帶著「你查的」與
+            # 「三竹回的」兩個 msgid —— 那兩個數字並排放，是這一頁唯一有用的資訊，
+            # 使用者一眼就看得出「這不是我那則」。
+            return self._status_unretryable_error_response(
+                heading="查詢無效：三竹回的是另一則簡訊（未扣點）",
+                message=str(exc),
+            )
+        if kind == mitake.KIND_BAD_RESPONSE:
+            return self._status_unretryable_error_response(
+                heading="三竹的回應解不開，無法判讀狀態（未扣點）",
+                message=str(exc),
+            )
         return self._status_generic_error_response(str(exc))
 
+    def _status_unretryable_error_response(
+        self, *, heading: str, message: str
+    ) -> Response:
+        """「三竹有回應，但那份回應不能當答案」的畫面 —— **不可出現「稍後再查」**。
+
+        涵蓋兩種：回的是別則簡訊（``msgid_mismatch``）、回應格式解不開
+        （``bad_response``）。兩者的共通點是**時間解決不了**：連線是通的，壞的是
+        回應內容本身，一秒後再查會拿到同一份東西。
+
+        和 :meth:`_status_generic_error_response` 分家的理由就只有這一句文案：
+        原本兩者共用「查詢是唯讀操作，稍後可以安全地再查一次」，於是格式問題被講成
+        暫時故障，使用者會反覆重整到放棄，而「拿 msgid 去三竹後台核對」這句真正的
+        出路被稀釋在後半段。
+        """
+        return _html_response(
+            HTTPStatus.BAD_GATEWAY,
+            templates.render_notice(
+                title="查詢無效",
+                heading=heading,
+                message=(
+                    f"{message} 這次查詢沒有扣點，簡訊本身的狀態不受影響"
+                    "（查詢是唯讀操作，不會動到那則簡訊）。"
+                ),
+                kind="error",
+                hint=(
+                    "重查不會得到不同的結果 —— 問題出在三竹回的內容，不是暫時的連線故障。"
+                    "請拿 msgid 到三竹後台核對，或聯絡三竹客服 02-25367777。"
+                ),
+            ),
+        )
+
     def _status_generic_error_response(self, message: str) -> Response:
-        """查詢失敗但可以再試的統一畫面。**一定要講「沒有扣點」。**"""
+        """查詢失敗但**真的可以再試**的統一畫面。一定要講「沒有扣點」。
+
+        給的是暫時性失敗：網路不通、三竹系統忙、未預期的內部錯誤。
+        「回應解不開」「回的是別則簡訊」那兩種請走
+        :meth:`_status_unretryable_error_response` —— 對它們說「稍後再查」是騙人的。
+        """
         return _html_response(
             HTTPStatus.BAD_GATEWAY,
             templates.render_notice(

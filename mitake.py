@@ -61,10 +61,13 @@ __all__ = [
     "DELIVERY_UNKNOWN",
     "KIND_API",
     "KIND_AUTH_FAILED",
+    "KIND_BAD_RESPONSE",
     "KIND_DECODE",
     "KIND_IP_BLOCKED",
+    "KIND_MSGID_MISMATCH",
     "KIND_NETWORK",
     "KIND_UNCONFIRMED",
+    "MAX_RESPONSE_BYTES",
     "MAX_SEGMENTS_PER_SEND",
     "MitakeAPIError",
     "MitakeConfigError",
@@ -100,6 +103,24 @@ ENV_PASSWORD = "MITAKE_PASSWORD"
 # 不設無限等待，否則 Web 介面的請求執行緒會被卡死。
 DEFAULT_TIMEOUT_SECONDS = 25.0
 
+# 單次回應的讀取上限（64 KiB）。三竹的真實回應最長也不過數十位元組
+# （`AccountPoint=12571` 是 19 個），所以這條線的用途不是「怕記憶體不夠」，
+# 而是把「拿到的東西根本不是三竹的回應」這件事變成一個會爆出來的錯誤：
+# 中間有代理器回了一整頁 HTML 錯誤頁、DNS 被劫持到別的網站、或連線串到別的服務，
+# 症狀都是「一大坨解得開但毫無意義的文字」。之前沒有上限時，那一大坨會被原樣塞進
+# 錯誤訊息（實測 20 萬字元的回應產生 20 萬位元組的錯誤頁），錯誤頁本身變成新的問題。
+#
+# ⚠️ 這個上限**不影響正常大小的回應**：讀取邏輯只在「超過上限」時才改變行為，
+# 未超過時回傳的位元組與沒有上限時逐位元組相同（見 _read_capped 與 _fetch_raw）。
+# 這一點很重要 —— _fetch_raw 是 query_balance / send_sms / query_message_status
+# 三者共用的底層，而 query_balance 每天 08:00 被 n8n2vps-hub 的餘額告警排程呼叫。
+MAX_RESPONSE_BYTES = 64 * 1024
+
+# 錯誤訊息裡最多帶多少字的回應原文。留 200 字是為了「一眼看得出拿到的是什麼東西」
+# （HTML 錯誤頁的前 200 字就足以認出是 nginx 還是 Cloudflare），再多就只是把終端機
+# 和錯誤頁灌爆 —— 而錯誤訊息會被渲染進網頁、寄進告警信，長度是真的有代價的。
+_ERROR_TEXT_PREVIEW_CHARS = 200
+
 # 中文簡訊走 UCS-2，每則上限 70 字。純英數其實可到 160 字，但本工具是內部中文用途，
 # 一律以 70 計 —— 成本估算寧可高估也不低估（低估會讓人誤以為還有點數可用）。
 CHARS_PER_SEGMENT = 70
@@ -124,6 +145,16 @@ KIND_NETWORK = "network"
 KIND_DECODE = "decode"
 KIND_UNCONFIRMED = "unconfirmed"
 KIND_API = "api"
+# 三竹有回應，但那份回應無法被當成「你問的那件事的答案」——格式解不開、欄位不足、
+# 或大到不可能是三竹的回應。與 network 的差別是**重試沒有用**：連線本身是通的，
+# 壞的是回應內容，重查一百次還是同一份解不開的東西。上層要導向「拿 msgid 去後台
+# 核對」，而不是「稍後再試」。
+KIND_BAD_RESPONSE = "bad_response"
+# 三竹回的是**另一則簡訊**的狀態（回傳 msgid 與查詢 msgid 不符）。單獨一個 kind 是
+# 因為它的處置與其他錯誤都不同：畫面必須同時秀出兩個 msgid，讓人一眼看出「這不是
+# 我查的那則」。歸進 bad_response 的話，錯誤頁只會說「回應看不懂」，反而蓋掉了
+# 真正該講的那句話。
+KIND_MSGID_MISMATCH = "msgid_mismatch"
 
 # 解碼順序：三竹回應實測是 Big5。cp950 是 Big5 的超集，放最後當保險；
 # utf-8 夾在中間是為了容忍未來三竹改版（若已改 UTF-8，big5 多半會先解碼失敗）。
@@ -265,6 +296,19 @@ def _get_credentials() -> tuple[str, str]:
     return credentials[ENV_USERNAME], credentials[ENV_PASSWORD]
 
 
+def _preview_for_error(text: str) -> str:
+    """把回應原文縮成錯誤訊息塞得下的長度，回傳可直接嵌入訊息的字串。
+
+    未超過 :data:`_ERROR_TEXT_PREVIEW_CHARS` 時回傳的就是 ``repr(text)``，
+    與原本直接寫 ``{text!r}`` **逐字元相同** —— 正常大小的回應不會因為加了這層
+    而換一種錯誤訊息。超過時才截斷，並明講「已截斷」與原文長度，免得有人以為
+    三竹真的只回了那 200 個字（那會把人導向錯誤的排查方向）。
+    """
+    if len(text) <= _ERROR_TEXT_PREVIEW_CHARS:
+        return repr(text)
+    return "{!r}…（已截斷，原文共 {} 字元）".format(text[:_ERROR_TEXT_PREVIEW_CHARS], len(text))
+
+
 def decode_response(raw: bytes) -> str:
     """把三竹回應的位元組解成文字，依序嘗試 big5 → utf-8 → cp950。
 
@@ -386,11 +430,36 @@ def parse_response(text: str) -> dict[str, Any]:
     }
 
 
+def _normalize_statuscode(statuscode: str) -> str:
+    """狀態碼的比對用正規化：去前後空白 + 轉小寫。
+
+    三竹文件上的碼全是小寫（``k`` / ``e`` / ``*`` …），實測回的也是小寫，所以這層
+    只是容錯 —— 但容錯的價值不對稱：把 ``K`` 讀成「未知狀態碼」會讓「IP 不在白名單」
+    這個純設定問題被講成「這則簡訊狀態不明」，使用者於是去追一個根本沒問題的簡訊，
+    而真正該做的是寄信給三竹加白名單。
+
+    ⚠️ 只用於**查表比對**，絕不拿來改寫回傳給呼叫端的 statuscode：原始值要原樣留著
+    給 log 與稽核，不然日後想查「三竹到底回了什麼」會查到我們自己改過的版本。
+    """
+    return statuscode.strip().lower()
+
+
 def classify_statuscode(statuscode: str | None) -> str:
-    """把 statuscode 對應到 ``KIND_*``，讓上層不必比對中文錯誤字串。"""
-    if statuscode == STATUSCODE_IP_BLOCKED:
+    """把 statuscode 對應到 ``KIND_*``，讓上層不必比對中文錯誤字串。
+
+    先比原值、再比正規化後的值（見 :func:`_normalize_statuscode`）。兩段式而非直接
+    比正規化值，是為了保證「所有現行實測碼的行為逐字不變」，正規化只多接住原本會
+    掉進 ``KIND_API`` 的大小寫變體。
+    """
+    if statuscode is None:
+        return KIND_API
+    if statuscode in (STATUSCODE_IP_BLOCKED, STATUSCODE_AUTH_FAILED):
+        normalized = statuscode
+    else:
+        normalized = _normalize_statuscode(statuscode)
+    if normalized == STATUSCODE_IP_BLOCKED:
         return KIND_IP_BLOCKED
-    if statuscode == STATUSCODE_AUTH_FAILED:
+    if normalized == STATUSCODE_AUTH_FAILED:
         return KIND_AUTH_FAILED
     return KIND_API
 
@@ -493,12 +562,43 @@ def _scrub_credentials_from_exception(exc: BaseException) -> None:
     exc.__traceback__ = None
 
 
+def _read_capped(response: Any, limit: int) -> bytes:
+    """從 response 讀出最多 ``limit`` 個位元組，讀滿或讀到 EOF 就停。
+
+    **正常大小的回應（總長 < limit）拿到的位元組與 ``response.read()`` 完全相同**，
+    因為迴圈會一路讀到 ``read()`` 回空為止才結束 —— 這正是無上限版本的終止條件。
+    差別只在「總長 ≥ limit」時提早收手，那時呼叫端會判定回應異常並拋錯。
+
+    為什麼是迴圈而不是單一次 ``response.read(limit)``：``read(n)`` 的契約是
+    「**最多** n 個位元組」，允許短讀。CPython 的 ``http.client.HTTPResponse``
+    實務上不會短讀，但這裡讀的是 opener 回傳的任意檔案物件（含未來換掉的實作），
+    賭它不短讀就等於賭「有一天不會靜默截斷 query_balance 的回應」——
+    而截斷後的 ``AccountPoi`` 解析出來會是「查不到餘額」，是那個每天 08:00
+    跑的告警排程最不該收到的假訊號。迴圈把這個賭注拿掉。
+    """
+    chunks: list[bytes] = []
+    remaining = limit
+    while remaining > 0:
+        chunk = response.read(remaining)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
 def _fetch_raw(endpoint: str, params: dict[str, str], timeout: float) -> bytes:
     """組出帶憑證的 URL、送出 GET、回傳原始位元組。
 
     憑證的生命週期被刻意壓在這個函式裡，而且在送出請求前就 ``del`` 掉，
     讓這一層 frame 的 locals 在 traceback 中不含明文帳密。
     例外在這裡先被洗過再往上拋，上層只負責分類。
+
+    讀取有 :data:`MAX_RESPONSE_BYTES` 的上限。超過就視為「這根本不是三竹的回應」
+    而丟 :class:`MitakeAPIError`，**不截斷後照常解析** —— 三竹的正常回應是數十
+    位元組，會超過 64 KiB 的東西（代理器的 HTML 錯誤頁、被劫持到別的網站）
+    截頭去尾之後解出來的任何「狀態」都是憑空捏造的，而畫面會把它當成三竹說的顯示。
+    寧可明確報「回應不對」讓人去查，也不要湊一個看起來像答案的東西。
     """
     username, password = _get_credentials()
     query = dict(params)
@@ -515,7 +615,8 @@ def _fetch_raw(endpoint: str, params: dict[str, str], timeout: float) -> bytes:
 
     try:
         with _OPENER.open(request, timeout=timeout) as response:
-            return response.read()
+            # 多讀 1 個位元組才分得出「剛好等於上限」與「超過上限」。
+            payload = _read_capped(response, MAX_RESPONSE_BYTES + 1)
     except BaseException as exc:
         # 型別刻意放到最寬：下一行就是裸 raise，不吞、不改變任何例外的傳播，
         # 但能保證「任何」逃出這層的例外都經過憑證洗滌。
@@ -529,6 +630,24 @@ def _fetch_raw(endpoint: str, params: dict[str, str], timeout: float) -> bytes:
     finally:
         # Request.full_url 一樣含帳密，別讓它留在 traceback 的 frame locals 裡。
         del request
+
+    # ↓ 這一段刻意放在 try 之外：它拋的是我們自己的 MitakeAPIError，不需要（也不該）
+    # 經過憑證洗滌那層 —— 那層會把 __traceback__ 清成 None，白白丟掉診斷資訊。
+    if len(payload) > MAX_RESPONSE_BYTES:
+        charged = endpoint == ENDPOINT_SEND
+        raise MitakeAPIError(
+            "三竹回應超過 {} 位元組的上限（endpoint={}），已中止讀取；"
+            "這不像是三竹的回應（正常僅數十位元組），可能是中間有代理器或"
+            "連到了別的服務。前 200 位元組：{!r}".format(
+                MAX_RESPONSE_BYTES, endpoint, payload[:200]
+            ),
+            # 發送情境下請求已經送達三竹（我們甚至讀到了回應），只是看不懂它，
+            # 這正是 unconfirmed 的定義：別重送，拿 msgid 去後台查。
+            kind=KIND_UNCONFIRMED if charged else KIND_BAD_RESPONSE,
+            possibly_charged=charged,
+        )
+
+    return payload
 
 
 def _request(
@@ -772,6 +891,26 @@ def send_sms(
 # 注意兩種回應的**格式完全不同**：前者是 key=value，後者是 Tab 分隔的三欄。
 # 所以這裡另寫 parse_status_response，不去動 parse_response——把 Tab 格式硬塞進
 # 既有解析器，等於為了一個新功能去改一支每天都在跑的函式。
+#
+# ═══════════════════════════════════════════════════════════════════════════
+# 🔴 本區段鐵律：「拒絕猜測」有**兩半**，缺一半等於沒有
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# 這一頁的使用者是為了「查證」才來的 —— 他手機沒響、畫面卻說三竹已接收。他對這一頁
+# 的信任度是 100%，所以這裡顯示的每一個字都必須是三竹**對這則簡訊**說的，不能是我們
+# 湊出來或順手放行的。具體拆成兩條，兩條都必須拋錯，不可只 log 就放行：
+#
+#   1. **格式異常** → 拋錯。空回應、欄位不足、拿到 key=value 格式。
+#      實作在 parse_status_response（kind=KIND_BAD_RESPONSE）。
+#   2. **身分不符** → 拋錯。三竹回的 msgid 不是我們問的那個。
+#      實作在 query_message_status（kind=KIND_MSGID_MISMATCH）。
+#
+# 為什麼要把這條寫成明文規則：第一版只做了第 1 條，第 2 條寫成 logger.warning 就放行，
+# 而且**看起來很合理**（「三竹說什麼我們就顯示什麼，不改寫」）。實測後果是查 A 卻看到
+# B 的狀態，整頁綠色「已送達手機」，A 的 msgid 一個字都沒出現。兩條的判斷標準是同一句：
+# **「這份回應能不能證明它在講使用者問的那件事？」不能，就拋錯。**
+#
+# 日後新增任何回應檢查（例如三竹加了欄位、加了批次回應），先回到這句話對一次。
 
 # 狀態分類。分類的用途是「畫面該怎麼講、使用者接下來該做什麼」，不是原樣照抄三竹文件。
 DELIVERY_PENDING = "pending"  # 還在路上，稍後再查會變
@@ -858,10 +997,25 @@ def validate_msgid(msgid: str) -> str:
 def describe_delivery_status(statuscode: str | None) -> tuple[str, str]:
     """把狀態碼翻成 ``(中文說明, 分類)``；沒收錄的碼回 ``DELIVERY_UNKNOWN``。
 
-    **大小寫敏感**（三竹的碼本來就是小寫）。把未知碼歸成 unknown 而不是猜一個最接近
-    的分類，是同一條老規矩：寧可說「不知道」讓人去查，也不要謊報「已送達」。
+    查表前會做**大小寫與前後空白的正規化**（見 :func:`_normalize_statuscode`）：
+    先比原值、比不到才比正規化值，所以所有現行實測碼的行為逐字不變，正規化只多接住
+    原本會掉進 unknown 的變體。之所以要接住：``K`` 落到「無法辨識的狀態碼」會把
+    「IP 不在白名單」這個純設定問題講成「這則簡訊狀態不明」，使用者於是去追一則
+    根本沒問題的簡訊，而該做的事（寄信給三竹加白名單）沒人去做。
+
+    ⚠️ **本函式不改寫 statuscode 本身** —— 正規化只用於查表，呼叫端拿到的
+    ``statuscode`` 永遠是三竹回的原值（:func:`parse_status_response` 也照原樣回傳），
+    否則日後想核對「三竹到底回了什麼」會核對到我們自己改過的版本。
+
+    真正沒收錄的碼一律歸 unknown，不猜一個最接近的分類 —— 同一條老規矩：
+    寧可說「不知道」讓人去查，也不要謊報「已送達」。
     """
-    known = DELIVERY_STATUS_TABLE.get(statuscode) if statuscode is not None else None
+    if statuscode is None:
+        return ("未知狀態碼（三竹未定義，或本模組尚未收錄）", DELIVERY_UNKNOWN)
+
+    known = DELIVERY_STATUS_TABLE.get(statuscode)
+    if known is None:
+        known = DELIVERY_STATUS_TABLE.get(_normalize_statuscode(statuscode))
     if known is None:
         return ("未知狀態碼（三竹未定義，或本模組尚未收錄）", DELIVERY_UNKNOWN)
     return known
@@ -890,9 +1044,11 @@ def parse_status_response(text: str) -> dict[str, Any]:
         原始整段文字，供日後三竹改格式時追查。
 
     格式不符（空回應、欄位不足、拿到 key=value 格式）一律丟
-    :class:`MitakeAPIError`（``possibly_charged`` 恆為 False —— 這是唯讀查詢）。
-    刻意不「盡量湊出一個結果」：湊出來的狀態會被畫面當成真的投遞結果顯示，
-    而使用者無從分辨那是三竹說的還是我們猜的。
+    :class:`MitakeAPIError`，``kind=KIND_BAD_RESPONSE``、``possibly_charged``
+    恆為 False（唯讀查詢）。刻意不「盡量湊出一個結果」：湊出來的狀態會被畫面當成
+    真的投遞結果顯示，而使用者無從分辨那是三竹說的還是我們猜的。
+    這是本區段「拒絕猜測」鐵律的其中一半，另一半在 :func:`query_message_status`
+    （身分不符也要拋錯）—— 兩者缺一，整條鐵律就等於沒有。
     """
     if not isinstance(text, str):
         raise MitakeValidationError(
@@ -908,8 +1064,10 @@ def parse_status_response(text: str) -> dict[str, Any]:
     line = next((s for s in (raw.strip(" \n") for raw in normalized.split("\n")) if s), "")
     if not line:
         raise MitakeAPIError(
-            f"三竹狀態查詢回應是空的：{text!r}",
-            kind=KIND_API,
+            f"三竹狀態查詢回應是空的：{_preview_for_error(text)}",
+            # bad_response 而不是 api：連線是通的，壞的是回應內容，重查一百次還是
+            # 同一份空回應。上層要導向「拿 msgid 去三竹後台核對」，不是「稍後再試」。
+            kind=KIND_BAD_RESPONSE,
             possibly_charged=False,
         )
 
@@ -921,8 +1079,8 @@ def parse_status_response(text: str) -> dict[str, Any]:
     if len(fields) < 2 or not fields[0] or not fields[1]:
         raise MitakeAPIError(
             "三竹狀態查詢回應格式不符（預期 msgid、狀態碼、狀態時間三欄，"
-            f"以 Tab 分隔）：{text!r}",
-            kind=KIND_API,
+            f"以 Tab 分隔）：{_preview_for_error(text)}",
+            kind=KIND_BAD_RESPONSE,
             possibly_charged=False,
         )
 
@@ -965,6 +1123,10 @@ def query_message_status(
     * **系統類狀態碼**（``*``/``a``/``b``/``r``/``s``）代表三竹那端暫時異常，
       這裡**照常回傳**（``category=DELIVERY_ERROR``、``is_final=False``），
       讓畫面可以說「三竹系統忙碌，稍後再查」而不是把人導去改設定。
+
+    另外一種失敗是**身分不符**：三竹回的 msgid 不是你查的那個。這代表回應講的是
+    另一則簡訊，一律丟 ``kind=KIND_MSGID_MISMATCH`` 的 :class:`MitakeAPIError`，
+    訊息同時帶上兩個 msgid。詳見本區段開頭的「拒絕猜測」鐵律。
     """
     clean_msgid = validate_msgid(msgid)
 
@@ -992,12 +1154,31 @@ def query_message_status(
         )
 
     if status["msgid"] != clean_msgid:
-        # 三竹正常會回傳你問的那個 msgid。對不上時仍照回（不猜、不改寫），
-        # 但要留一行線索：畫面上顯示的狀態可能不是你查的那則。
+        # 三竹正常會回傳你問的那個 msgid。對不上代表這份回應講的是**另一則簡訊**，
+        # 拿它當答案就是拿別人的狀態冒充你的。
+        #
+        # 這裡曾經只 logger.warning 就放行，實測後果：查 0315772761、三竹回
+        # 9999999999<TAB>4，畫面整頁是綠色的「已送達手機」，而使用者查的那個
+        # msgid 一個字都沒出現在頁面上 —— 他會相信對方收到了。反向（回傳的那則
+        # 其實已送達、畫面卻說「沒送到，可以重發」）更貴：多扣一點、對方收到兩封。
+        #
+        # log 留不住這件事：這個功能存在的前提就是「使用者不會去看 journalctl」，
+        # 他就是為了查證才來這一頁的。唯一誠實的回應是明確失敗。
         logger.warning(
-            "三竹回傳的 msgid 與查詢的不符：查詢=%s 回傳=%s",
+            "三竹回傳的 msgid 與查詢的不符，已拒絕這次結果：查詢=%s 回傳=%s",
             clean_msgid,
             status["msgid"],
+        )
+        raise MitakeAPIError(
+            "三竹回覆的是另一則簡訊的狀態（你查的是 {}，三竹回的是 {}）。"
+            "本次查詢未扣點。請拿 msgid 到三竹後台核對，"
+            "或聯絡三竹客服 02-25367777。".format(clean_msgid, status["msgid"]),
+            statuscode=status["statuscode"],
+            kind=KIND_MSGID_MISMATCH,
+            # 查詢走的是唯讀免費的 SmQuery，從來不扣點。這裡不可以「保守起見」寫
+            # True —— 那會讓 Web 層顯示「請勿重送」，而重查一次根本沒有代價。
+            possibly_charged=False,
+            response=status,
         )
 
     # 只記 msgid 與狀態碼：這兩者不是個資，也不含簡訊內容。

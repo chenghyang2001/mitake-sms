@@ -1702,6 +1702,119 @@ def test_status_unexpected_exception_does_not_leak_internals(tmp_path: Path) -> 
     assert "沒有扣點" in response.text
 
 
+def test_status_mismatch_page_shows_both_msgids(tmp_path: Path) -> None:
+    """**MUST_FIX 的 web 層鎖**：回的是別則簡訊時，兩個 msgid 都要出現在畫面上。
+
+    修正前的實測症狀是「整頁綠色『已送達手機』，而使用者查的 0315772761 一個字
+    都沒出現」。所以這裡不只驗有錯誤頁，還驗**他查的那個號碼看得到** ——
+    看不到就等於在對他講另一件事，而他不會知道。
+    """
+    error = mitake.MitakeAPIError(
+        "三竹回覆的是另一則簡訊的狀態（你查的是 0315772761，三竹回的是 9999999999）。"
+        "本次查詢未扣點。請拿 msgid 到三竹後台核對，或聯絡三竹客服 02-25367777。",
+        kind=mitake.KIND_MSGID_MISMATCH,
+        possibly_charged=False,
+    )
+    app = make_app(
+        tmp_path, RecordingSender(), status_query=RecordingStatusQuery(error=error)
+    )
+
+    response = query_status(app, "0315772761")
+
+    assert response.status == HTTPStatus.BAD_GATEWAY
+    assert "0315772761" in response.text  # 他查的那則
+    assert "9999999999" in response.text  # 三竹回的那則
+    # 絕不能出現成功語氣：這一頁沒有任何「已送達」可言。
+    assert "已送達手機" not in response.text
+
+
+def test_status_mismatch_page_does_not_promise_that_retrying_helps(
+    tmp_path: Path,
+) -> None:
+    """身分不符是「重查沒用」那一族，文案不可出現「稍後再查」。
+
+    出現的話使用者會照做 —— 重整、失敗、再重整，被釘在一個永遠不會成功的迴圈裡，
+    而真正該做的事（拿 msgid 去三竹後台核對、打客服）一個字都沒被講。
+    """
+    error = mitake.MitakeAPIError(
+        "三竹回覆的是另一則簡訊的狀態（你查的是 0315772761，三竹回的是 9999999999）。",
+        kind=mitake.KIND_MSGID_MISMATCH,
+        possibly_charged=False,
+    )
+    app = make_app(
+        tmp_path, RecordingSender(), status_query=RecordingStatusQuery(error=error)
+    )
+
+    text = query_status(app, "0315772761").text
+
+    assert "稍後" not in text
+    assert "三竹後台" in text
+    assert "02-25367777" in text
+    assert "未扣點" in text or "沒有扣點" in text
+
+
+def test_status_bad_response_page_points_at_the_console_not_at_retrying(
+    tmp_path: Path,
+) -> None:
+    """「格式解不開」同樣是重查沒用 —— 一起走不可重試的那頁。
+
+    這條涵蓋空 msgid／欄位不足／拿到 key=value 那幾種，它們原本共用
+    「查詢是唯讀操作，稍後可以安全地再查一次」的文案。
+    """
+    error = mitake.MitakeAPIError(
+        "三竹狀態查詢回應格式不符（預期 msgid、狀態碼、狀態時間三欄，以 Tab 分隔）",
+        kind=mitake.KIND_BAD_RESPONSE,
+        possibly_charged=False,
+    )
+    app = make_app(
+        tmp_path, RecordingSender(), status_query=RecordingStatusQuery(error=error)
+    )
+
+    response = query_status(app, "0315772761")
+
+    assert response.status == HTTPStatus.BAD_GATEWAY
+    assert "稍後" not in response.text
+    assert "三竹後台" in response.text
+    assert "02-25367777" in response.text
+
+
+def test_status_network_error_still_offers_a_retry(tmp_path: Path) -> None:
+    """回歸（分家的另一邊）：真正暫時性的失敗**必須**保留「稍後再查」。
+
+    新增「重查沒用」那條路的代價若是把可重試的文案也一起改掉，就是從一種誤導換成
+    另一種：網路抖一下就叫人去打三竹客服。這支確保兩邊各自留在自己的分支。
+    """
+    error = mitake.MitakeAPIError(
+        "無法連線至三竹 API", kind=mitake.KIND_NETWORK, possibly_charged=False
+    )
+    app = make_app(
+        tmp_path, RecordingSender(), status_query=RecordingStatusQuery(error=error)
+    )
+
+    text = query_status(app, "0315772761").text
+
+    assert "稍後可以安全地再查一次" in text
+    assert "沒有扣點" in text
+
+
+def test_system_error_status_still_says_try_again_later(tmp_path: Path) -> None:
+    """回歸：系統類狀態碼（`*`）是回傳值而非例外，仍然走「稍後再查」的結果頁。
+
+    它和 bad_response 只差一個字的距離，卻是相反的建議 —— `*` 是三竹那端暫時忙，
+    等一下真的會變；bad_response 是回應本身解不開，等一百年也一樣。
+    """
+    app = make_app(
+        tmp_path,
+        RecordingSender(),
+        status_query=RecordingStatusQuery(result=status_result("*")),
+    )
+
+    text = query_status(app, "0315772761").text
+
+    assert "系統發生錯誤" in text
+    assert "稍後再查" in text
+
+
 def test_status_future_mitake_error_is_contained(tmp_path: Path) -> None:
     """mitake.py 日後新增的例外型別要落到通用畫面，不該整個 500。"""
     app = make_app(
