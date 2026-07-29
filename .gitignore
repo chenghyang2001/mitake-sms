@@ -3,6 +3,10 @@
 *.env
 !.env.example
 
+# 發送稽核記錄（含收件人號碼＝個人資料，本 repo 是 public，絕不可進版控）
+logs/
+*.jsonl
+
 # 當機/垃圾檔
 *.stackdump
 core
