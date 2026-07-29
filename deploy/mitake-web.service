@@ -1,0 +1,90 @@
+# 三竹簡訊 Web 發送介面（第三部分）的 systemd unit。
+#
+# 安裝：
+#   sudo cp /home/claude/mitake-sms/deploy/mitake-web.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now mitake-web.service
+#   curl -sS http://127.0.0.1:8766/health
+#
+# 🔴 上線順序不可跳步（每一步都先確認再往下）：
+#   1. 只綁 127.0.0.1，用 curl 在 VPS 上驗證（本 unit 的預設值就是這樣）
+#   2. 真發一則測試簡訊到自己的號碼（扣 1 點，需人工確認）
+#   3. 設 Cloudflare Zero Trust Access，限定 chenghyang2001@gmail.com
+#      → 同時打開下方的 MITAKE_WEB_REQUIRE_ACCESS_EMAIL（兩件事要一起做，見該行註解）
+#   4. 最後才在 ~/.cloudflared/config.yml 加 ingress + tunnel route dns
+#      （改完要 restart cloudflared，它不支援 reload）
+#   在第 3 步完成前，絕對不要把 --host 改成 0.0.0.0 —— 這個介面每送一則就從
+#   與 App 團隊共用的點數池扣 1 點，裸奔等於把付費簡訊閘道開給全世界。
+#   （程式本身也擋：非 loopback 位址必須同時加 --allow-public 才會啟動。）
+
+[Unit]
+Description=三竹簡訊 Web 發送介面（mitake-sms 第三部分）
+Documentation=https://github.com/chenghyang2001/mitake-sms
+After=network-online.target
+Wants=network-online.target
+# 反覆啟動失敗時不要無限重試燒 CPU，但也不要真的放棄（發簡訊介面掛掉要看得見）。
+# 注意這兩個是 [Unit] 層的設定，寫在 [Service] 會被新版 systemd 當成未知欄位忽略。
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=claude
+Group=claude
+WorkingDirectory=/home/claude/mitake-sms
+
+# 三竹帳密（MITAKE_USERNAME / MITAKE_PASSWORD）只放這個檔，權限 600、claude:claude。
+# 絕不進版控、絕不寫進本 unit。
+EnvironmentFile=/etc/mitake-sms.env
+
+# 稽核檔放 LogsDirectory 建出來的 /var/log/mitake-sms（systemd 會建目錄並設好擁有者），
+# 不落在 repo 裡 —— repo 會被 git pull 覆蓋，而且對帳紀錄不該進版控。
+Environment=MITAKE_WEB_AUDIT_PATH=/var/log/mitake-sms/send-audit.jsonl
+Environment=PYTHONUTF8=1
+Environment=PYTHONUNBUFFERED=1
+LogsDirectory=mitake-sms
+LogsDirectoryMode=0750
+
+# --- 應用層存取檢查（上線第 3 步設 CF Access 時，跟著把下面這行取消註解）---
+#
+# 設了之後，除 /health 外的每個請求都必須帶 Cf-Access-Authenticated-User-Email
+# 標頭且值等於這裡的 email，否則回 403。沒設＝完全不擋（本機 curl 測試照舊可用），
+# 但啟動時會在 journalctl 記一筆 WARNING 說「目前無應用層存取控制」。
+#
+# ⚠ 這不是真正的認證：該標頭是純文字、任何直接連到本服務的人都能自己加一個。
+#    真正可驗的是 Cf-Access-Jwt-Assertion 的 JWT 簽章，但驗它要拉 Cloudflare 的
+#    JWKS，會破壞本專案「只用標準庫」的鐵律，所以不做。
+#
+# 它真正的價值是**改變失敗模式**：Access 忘了設 / 設錯 / 先開 tunnel 才去設，
+# 這三種很普通的失誤原本都會安靜地變成「一個對全世界開放的付費簡訊閘道」，
+# 加了這行之後會變成一個一眼看得見的 403。壞掉會有人回報，安靜被利用不會。
+# 所以它取代不了第 3 步，只是第 3 步失手時的安全網 —— 兩者要一起做。
+#
+#Environment=MITAKE_WEB_REQUIRE_ACCESS_EMAIL=chenghyang2001@gmail.com
+
+# 🔴 鐵律：一定要寫 /usr/bin/python3.12 的絕對路徑。
+# 走 /usr/bin/python3（symlink）在這台 VPS 上會被未知機制 SIGKILL，
+# 服務會以「莫名其妙被砍」的樣子反覆重啟，且 journalctl 看不出原因。
+ExecStart=/usr/bin/python3.12 -m web.server --host 127.0.0.1 --port 8766
+
+Restart=always
+RestartSec=5
+
+# --- 沙箱（這個服務會拿到簡訊閘道憑證，權限收到最緊） ---
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+# 只需要 IPv4/IPv6（連三竹 API + 監聽 loopback），其餘 socket 家族一律關掉。
+RestrictAddressFamilies=AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target
