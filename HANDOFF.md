@@ -27,18 +27,42 @@ python3.12 -c "import mitake; print('餘額點數:', mitake.query_balance())"
 
 ## 2. 核心模組介面（mitake.py，零外部依賴）
 
-- `query_balance() -> int` — SmQuery，**免費**，回傳剩餘點數
-- `send_sms(phone, message) -> dict` — SmSend，**1 點/則**；成功回 `{"success": True, "msgid": ...}`
-- `validate_phone()` / `count_sms_segments()` / `parse_response()` / `classify_statuscode()` — 純函式
+- `query_balance(*, timeout=25.0) -> int` — SmQuery，**免費**，回傳剩餘點數
+- `send_sms(phone, body, *, timeout=25.0, max_segments=5) -> dict` — SmSend，**1 點/則**
+  - 回傳 `parse_response()` 的全部欄位（`success` / `statuscode` / `msgid` / `error` / `account_point` / `batch_index` / `raw_fields` / `raw_text`）再加 `segments` / `chars`，方便呼叫端記錄這次實際扣了幾點
+  - `max_segments` 是**送出任何網路請求之前**的防呆上限（預設 `MAX_SEGMENTS_PER_SEND = 5`），超過直接丟 `MitakeValidationError`，**不扣點**。要送超長內容必須明確傳 `max_segments=`，讓「我知道這會扣很多點」變成寫得出來的動作
+- `validate_phone()` / `count_sms_segments()` / `decode_response()` / `parse_response()` / `classify_statuscode()` — 純函式
 - 憑證只從環境變數讀：`MITAKE_USERNAME` / `MITAKE_PASSWORD`（缺少時明確報錯）
-- `python3.12 mitake.py` = 離線冒煙測試（不碰網路、不扣點）；完整測試在 `tests/test_mitake.py`（urlopen 已用替身攔住）
+- `python3.12 mitake.py` = 離線冒煙測試（不碰網路、不扣點）；完整測試在 `tests/test_mitake.py`
+
+### 2.1 🔴 錯誤處理：`possibly_charged` 是第三部分最需要先讀懂的欄位
+
+失敗有**兩種**，`MitakeAPIError` 用 `possibly_charged` 區分，Web 層必須渲染成不同畫面：
+
+| `possibly_charged` | 意義 | 該顯示什麼 |
+| ------ | ------ | ------ |
+| `False` | 三竹明確拒絕，**沒扣點** | 「發送失敗，可安全重試」 |
+| `True` | 請求已送達三竹但結果未確認，**多半已扣點** | 「狀態未確認，**請勿重送**，請至三竹後台以 msgid 查證」 |
+
+一律顯示「發送失敗，請重試」會直接誘導使用者重送 → **扣兩次點 + 對方收到兩封簡訊**。
+
+`kind` 讓上層不必比對中文字串就能分流：`ip_blocked`（找三竹加白名單）／`auth_failed`（改環境變數）／`network`／`decode`／`unconfirmed`（三竹收了請求但沒回可辨識的成敗）／`api`。
+
+例外階層：`MitakeError`（基底，可一句 `except MitakeError` 收斂）
+→ `MitakeConfigError`（環境變數缺漏）
+／`MitakeValidationError`（輸入不合法，**保證在送出網路請求前丟出，沒扣點**）
+／`MitakeAPIError`（呼叫三竹失敗，帶 `kind` 與 `possibly_charged`）
+
+⚠️ 已知待補：`possibly_charged` 目前**只存在於 `MitakeAPIError`**。Web 層若寫成 `except MitakeError as e: ... e.possibly_charged`，遇到 `MitakeValidationError` 會 `AttributeError`。動工前建議先在 `MitakeError` 補一個 class-level `possibly_charged = False`。
 
 ## 3. 三竹 API 鐵律（違反必踩坑）
 
 1. **IP 白名單強制**：未登記 IP 一律 `statuscode=k`／`無效的連線位址`，與帳密無關。已登記：`59.124.85.79`（公司）、`187.127.109.145`（VPS）。換機器先寄 `service@mitake.com.tw` 申請。
 2. **回應是 Big5**：UTF-8 硬解會亂碼（模組已處理，別繞過 `decode_response`）。
-3. **點數與 App 團隊共用**：App 靠同一池發註冊驗證碼。**測試一律用 `query_balance`（免費），絕不用 `send_sms` 當測試**；tests 必須 mock `urlopen`。
-4. 中文 70 字 = 1 則 = 1 點，超過倍增（`count_sms_segments` 已實作上限保護）。
+3. **點數與 App 團隊共用**：App 靠同一池發註冊驗證碼。**測試一律用 `query_balance`（免費），絕不用 `send_sms` 當測試**；tests 必須攔截 `mitake._OPENER.open`（**不是** `urllib.request.urlopen` —— `_fetch_raw` 已改走模組級 opener，patch 舊位置會讓測試真的連上三竹）。
+4. 中文 70 字 = 1 則 = 1 點，超過倍增。**上限保護在 `send_sms(max_segments=)`（預設 5 則），不在 `count_sms_segments`** —— 後者只負責計數、不會擋。護欄刻意放模組層而非 Web 層，因為 Web 層由別人實作且無存取控制。
+5. **禁止自動重試**：模組刻意不實作重試，失敗是否重送必須由人判讀 `possibly_charged` 後決定（見 §2.1）。
+6. **不要在 `send_sms` 前先呼叫 `query_balance` 檢查餘額**：本模組刻意不這樣做，以避免「查完到送出之間點數被 App 團隊用掉」的 TOCTOU，也避免查詢失敗連帶擋掉發送。好心加上這層檢查反而會引入 race。
 
 ## 4. VPS 環境鐵律（n8n2vps-hub tab 的既有經驗）
 
