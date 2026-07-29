@@ -1,0 +1,16 @@
+# mitake-sms session prompts（2026-07-29）
+
+/rc-info
+修 HANDOFF drift 和補 conftest autouse
+commit 完再收工
+
+## 過程中的裁示（AskUserQuestion）
+- 未 commit 的 WIP → 先 ultra-review 再 commit
+- ultra-review 報 3 項 🔴 → 修完 🔴 再 commit
+- conftest 鐵律分級 → 中等 + 派 reviewer
+- redirect 🔴 修法 → 禁止 redirect（reviewer 方案）
+- reviewer 的 3 項 🟡 → 全做（HTTPException 分支前移 / 洗憑證改 BaseException / 統一 kind 語意）
+- 逃生門第二把鎖（環境變數）→ 不做，維持單一 marker
+- conftest 第三輪 2 項 🟡 → 都修
+- 若再有 🔴 → 直接修到過不用問
+- 收工範圍 → 完整收工

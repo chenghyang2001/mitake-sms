@@ -59,7 +59,10 @@ python3.12 -c "import mitake; print('餘額點數:', mitake.query_balance())"
 
 1. **IP 白名單強制**：未登記 IP 一律 `statuscode=k`／`無效的連線位址`，與帳密無關。已登記：`59.124.85.79`（公司）、`187.127.109.145`（VPS）。換機器先寄 `service@mitake.com.tw` 申請。
 2. **回應是 Big5**：UTF-8 硬解會亂碼（模組已處理，別繞過 `decode_response`）。
-3. **點數與 App 團隊共用**：App 靠同一池發註冊驗證碼。**測試一律用 `query_balance`（免費），絕不用 `send_sms` 當測試**；tests 必須攔截 `mitake._OPENER.open`（**不是** `urllib.request.urlopen` —— `_fetch_raw` 已改走模組級 opener，patch 舊位置會讓測試真的連上三竹）。
+3. **點數與 App 團隊共用**：App 靠同一池發註冊驗證碼。**測試一律用 `query_balance`（免費），絕不用 `send_sms` 當測試**；tests 必須攔截 `mitake._OPENER.open`（**不是** `urllib.request.urlopen` —— `_fetch_raw` 走模組級 opener，patch 舊位置會讓測試真的連上三竹）。
+   - 這條已由 `tests/conftest.py` **從文件升級成機制**：預設封鎖 `_OPENER.open`，忘記攔截的測試會直接紅燈（拋 `RealMitakeAPICallBlocked`）而不是靜默扣點。錯誤訊息本身帶 nodeid 與修法。
+   - 真的要連外的測試掛 `@pytest.mark.allow_network`（唯讀的 `query_balance` 免費；`send_sms` 每則扣共用池 1 點，掛之前先想清楚）。
+   - **已知邊界**（護欄擋的是「忘記 mock」，不是「刻意繞過」，別當沙箱信任）：繞開 `_OPENER` 直接用 `urlopen`／裸 `socket`／第三方 client、`importlib.reload(mitake)`（會重建 `_OPENER`）、`subprocess`／`multiprocessing`（全新 process），以及比 `tests/conftest.py` 更早載入者（repo 根的 `conftest.py`、pytest 外掛）。
 4. 中文 70 字 = 1 則 = 1 點，超過倍增。**上限保護在 `send_sms(max_segments=)`（預設 5 則），不在 `count_sms_segments`** —— 後者只負責計數、不會擋。護欄刻意放模組層而非 Web 層，因為 Web 層由別人實作且無存取控制。
 5. **禁止自動重試**：模組刻意不實作重試，失敗是否重送必須由人判讀 `possibly_charged` 後決定（見 §2.1）。
 6. **不要在 `send_sms` 前先呼叫 `query_balance` 檢查餘額**：本模組刻意不這樣做，以避免「查完到送出之間點數被 App 團隊用掉」的 TOCTOU，也避免查詢失敗連帶擋掉發送。好心加上這層檢查反而會引入 race。
@@ -100,8 +103,9 @@ python3.12 -c "import mitake; print('餘額點數:', mitake.query_balance())"
 ## 7. 開工前 checklist（新 session 第一步）
 
 ```
-- [ ] 讀本手冊 + README.md
-- [ ] 本機跑 python mitake.py（離線冒煙）與 pytest tests/（若有 pytest）
+- [ ] 讀本手冊 + README.md（特別是 §2.1 possibly_charged 與 §3 鐵律）
+- [ ] 本機跑 python mitake.py（離線冒煙）與 pytest tests/（應為 6 passed）
+- [ ] 寫新測試前先讀 tests/conftest.py 檔頭：它預設封鎖所有對三竹的呼叫，忘記攔截會紅燈
 - [ ] SSH VPS 跑一次 query_balance 確認環境仍通（見 §1 指令）
 - [ ] 第二部分動工前：先讀 n8n2vps-hub 的 CLAUDE.md（部署鐵律）與 jobs/job_009 範本
 - [ ] 兩個功能都 >50 行 → 依「規格先行」原則先出規格 MD 給使用者確認再寫碼
