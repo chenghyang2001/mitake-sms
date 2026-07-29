@@ -30,3 +30,6 @@ Thumbs.db
 # 機器生成的 session 快照（每輪對話自動刷新，不進版本控制）
 .claude/session-state.md
 .gitnexus
+
+# Office 開檔時的暫存鎖檔（PowerPoint COM 做視覺 QA 會留下）
+~$*
