@@ -74,7 +74,50 @@ python3.12 -c "import mitake; print('餘額點數:', mitake.query_balance())"
 - Gmail App Password **含空格**：寫進 env 檔或 SMTP login 前必須去空格（`/etc/mitake-sms.env` 內已是去空格版本）。
 - VPS 的 git credential store 是**唯讀 PAT**：push 需另外帶寫入 token（embedded URL 用完即清），或改在本機 push。
 
-## 5. 第二部分：餘額告警排程（建議做成 n8n2vps-hub 的 job_010）
+## 5. 第二部分：餘額告警排程 ✅ 已完成上線（2026-07-29）
+
+| 項目 | 值 |
+| ------ | ------ |
+| 位置 | **n8n2vps-hub repo**，`jobs/job_010_mitake_balance/`（commit `cb0230e`） |
+| 排程 | 每日 **08:00 台灣時間**（APScheduler 帶 `Asia/Taipei`，非 UTC —— 已由 heartbeat 的 `+08:00` 時間戳證實） |
+| 門檻 | `warn=3000` / `critical=1000`（在 hub 的 `config.json`，**不是** env 檔） |
+| 通知 | Gmail + Telegram + LINE 三管道 |
+| 驗收 | 2026-07-29 手動觸發成功，餘額 12,571 點、level=normal、三管道全送達、heartbeat 已建 |
+
+### 5.1 動它之前必須知道的四件事
+
+1. **改完要走 `bash scripts/deploy.sh`**（hub repo 的鐵律），禁止在 VPS 直接改。
+2. 🔴 **`scripts/deploy.sh` 不會更新 `/home/claude/mitake-sms`** —— 它只 pull hub。本專案的 `mitake.py` 要自己 `cd ~/mitake-sms && git pull`，**而且 pull 完必須再 `sudo systemctl restart n8n2vps-hub.service`**，否則 `sys.modules` 裡還是舊模組。
+   （2026-07-29 部署當天就踩到：VPS 的 mitake-sms 落後 5 個 commit，跑的是還沒修過四類安全缺陷的舊版。）
+3. **告警門檻只看 hub 的 `config.json`**。`/etc/mitake-sms.env` 裡的 `MITAKE_ALERT_THRESHOLD` 是歷史殘留，**改了不生效也不報錯**。
+4. **`/etc/mitake-sms.env` 只有兩個 key 會被載入**（`MITAKE_USERNAME` / `MITAKE_PASSWORD`）。該檔實際還含 `GMAIL_APP_PASSWORD` / `GMAIL_USER` / `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` —— handler 用 allowlist 擋掉它們，因為全量載入會**永久污染 hub 那個 24/7 常駐 process**，讓其他 job 靜默改用這些憑證發通知。**不要把 allowlist 拿掉。**
+
+### 5.2 部署後驗證清單（deploy.sh 不會幫你檢查）
+
+```
+- [ ] cd ~/mitake-sms && git pull（有更新則再 restart 一次 hub）
+- [ ] ls -l /etc/mitake-sms.env → 權限 600
+- [ ] journalctl 確認「[job_010_mitake_balance] 排程已加入：08:00」
+- [ ] 手動觸發一次（SmQuery 免費不扣點）：
+      cd ~/n8n2vps-hub && env -u MITAKE_USERNAME -u MITAKE_PASSWORD \
+        ENV=prod python3.12 main.py --job job_010_mitake_balance
+      ⚠️ 一定要用 env -u 清掉變數。若先 source 那個 env 檔，handler 會走
+         「憑證已存在、跳過檔案載入」分支 —— 等於把要驗的路徑繞過去了，
+         而 log 依然全綠、通知照樣送達，看起來完全成功。
+      預期 log：「已從 /etc/mitake-sms.env 載入 2 個環境變數（值不記錄）」
+- [ ] ls logs/heartbeat/job_010_mitake_balance.json（沒有的話 25 小時後會誤發健康警報）
+```
+
+### 5.3 失敗告警的設計（改之前先看）
+
+只有「重試救不回、需要人動手」的失敗才發 job 專屬信：`ip_blocked` / `auth_failed` / `api` / 憑證檔問題 / 模組問題。
+`network` / `decode` **刻意不發** —— `core/retry.py` 的通用警報已含 traceback，資訊完全重疊，再發一封只是噪音。
+⚠️ **`api` 不可從清單移除**：`classify_statuscode` 把所有非 `k`/`e` 的錯誤碼都歸這裡，「帳號被停權」正落在此，那是這個 job 最該尖叫的一天。
+
+---
+
+<details>
+<summary>原始建議架構（2026-07-29 前一 session 的評估，保留供對照）</summary>
 
 **建議架構**（前一 session 的評估，接手者可再斟酌）：
 
@@ -86,6 +129,10 @@ python3.12 -c "import mitake; print('餘額點數:', mitake.query_balance())"
 - 參考範本：`jobs/job_009_weather_umbrella/`（同樣是「查外部 API → 門檻判斷 → 三管道通知」的 job）
 
 **替代方案**：獨立 cron 包 wrapper script — 較簡單但通知/重試/健康監控都要自己重寫，前一 session 不建議。
+
+（實際採用了上述 n8n2vps-hub 方案，細節見 §5.1–5.3。）
+
+</details>
 
 ## 6. 第三部分：Web 發送介面
 
