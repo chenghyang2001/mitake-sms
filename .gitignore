@@ -1,0 +1,27 @@
+# 機密（三竹帳密一律走環境變數，絕不進版控）
+.env
+*.env
+!.env.example
+
+# 當機/垃圾檔
+*.stackdump
+core
+*.core
+*.dmp
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# 編輯器/系統
+*~
+*.swp
+.DS_Store
+Thumbs.db
+
+# 機器生成的 session 快照（每輪對話自動刷新，不進版本控制）
+.claude/session-state.md
