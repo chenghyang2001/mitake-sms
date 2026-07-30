@@ -1,0 +1,11 @@
+# tools/ producer 專用依賴（build_recipients.py）。
+#
+# ⚠️ 刻意與核心零依賴服務分離：repo 根的 mitake.py 與 web/ 只用 Python 標準庫，
+# 不受本檔影響。只有這支「內網 producer 工具」需要下列第三方套件。
+# 核心服務的依賴請看 repo 根的 requirements.txt（目前刻意保持零第三方）。
+#
+# 首次使用 playwright 需另外安裝瀏覽器執行檔（不是 pip 套件的一部分）：
+#   playwright install chromium
+
+pymysql>=1.1
+playwright>=1.40
