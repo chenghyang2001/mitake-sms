@@ -19,4 +19,11 @@
 ``import mitake``，若這裡先 import 子模組，反而會讓匯入順序變得脆弱。
 """
 
-__all__ = ["audit", "server", "templates"]
+# 版本資訊的**單一真相來源**。側欄（web.templates._sidebar）與測試都從這裡取值，
+# 而不是各自寫死字串 —— 改版號只改這一處，全站與回歸測試會同步跟著動。
+# 這裡放純字串常數不違反「本檔不 import 子模組」的原則（見上方 docstring）：
+# 脆弱的是匯入順序，不是模組層常數。
+__version__ = "0.001"
+__release_date__ = "2026-07-30"
+
+__all__ = ["audit", "server", "templates", "__version__", "__release_date__"]

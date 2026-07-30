@@ -2017,6 +2017,62 @@ def test_status_tone_table_covers_every_mitake_category() -> None:
     } <= mitake_categories
 
 
+# --------------------------------------------------------------------------- #
+# 18. 兩欄式版面（側欄要在每一頁、版本取自常數、/trial-email 占位頁受保護）
+# --------------------------------------------------------------------------- #
+
+
+def test_sidebar_appears_on_every_page(tmp_path: Path) -> None:
+    """側欄（品牌 + 兩個導覽入口）必須出現在全站每一頁，而不只首頁。
+
+    版面是套在 `_page`（所有頁面的共同外框）上的，所以只要抽三種不同流程的頁面
+    ——發送表單、占位頁、投遞狀態表單——驗品牌字與兩個入口字串都在即可。
+    """
+    app = make_app(tmp_path, RecordingSender())
+
+    for response in (
+        app.route("GET", "/"),
+        app.route("GET", "/trial-email"),
+        app.route("GET", "/status"),
+    ):
+        assert response.status == HTTPStatus.OK, response.text
+        assert "三竹簡訊工具" in response.text
+        assert "發送三竹簡訊" in response.text
+        assert "14天用戶體驗-郵件數據寄送" in response.text
+
+
+def test_sidebar_shows_version_and_release_date(tmp_path: Path) -> None:
+    """側欄的版本號與發布日要取自 `web` 套件常數（改常數就跟著動，不是各處寫死）。"""
+    from web import __release_date__, __version__
+
+    body = make_app(tmp_path, RecordingSender()).route("GET", "/").text
+
+    assert f"v{__version__}" in body
+    assert __release_date__ in body
+
+
+def test_trial_email_stub_is_protected_and_get_only(tmp_path: Path) -> None:
+    """`/trial-email` 占位頁：GET 回「建置中」、受 Access 保護、非 GET 回 405。
+
+    受 Access 保護這點沿用「設了 require_access_email 之後除 /health 外一律要擋」
+    那套做法：不帶身分標頭連占位頁都要被擋（403）—— 整個介面只要開了 Access，
+    就不該有任何頁面漏在保護外。
+    """
+    open_app = make_app(tmp_path, RecordingSender())
+    stub = open_app.route("GET", "/trial-email")
+    assert stub.status == HTTPStatus.OK
+    assert "建置中" in stub.text
+
+    guarded = make_app(
+        tmp_path, RecordingSender(), require_access_email="peter@example.com"
+    )
+    assert guarded.route("GET", "/trial-email").status == HTTPStatus.FORBIDDEN
+
+    assert (
+        open_app.route("POST", "/trial-email").status == HTTPStatus.METHOD_NOT_ALLOWED
+    )
+
+
 def test_live_server_passes_the_query_string_to_the_status_page(tmp_path: Path) -> None:
     """端對端：``?msgid=`` 真的有從 HTTP 層傳到路由層。
 

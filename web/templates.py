@@ -23,6 +23,12 @@ from __future__ import annotations
 from html import escape as _e
 from urllib.parse import quote as _q
 
+# 版本常數的唯一來源在 web/__init__.py。templates 是以 web.templates 被匯入的，
+# 匯入本模組時 web 套件的 __init__ 早已執行完，所以這裡讀 web.__version__ 是安全的
+# （不會踩到 web/__init__.py docstring 提到的「先 import 子模組」那條脆弱路徑）。
+from web import __release_date__ as APP_RELEASE_DATE
+from web import __version__ as APP_VERSION
+
 __all__ = [
     "REASON_CONFIG_MISSING",
     "REASON_MITAKE_REJECTED",
@@ -37,6 +43,7 @@ __all__ = [
     "render_sent",
     "render_status_form",
     "render_status_result",
+    "render_trial_email_stub",
     "status_query_url",
 ]
 
@@ -64,10 +71,35 @@ REASON_NEVER_REACHED_MITAKE = (
 _STYLE = """
 :root { color-scheme: light; }
 * { box-sizing: border-box; }
-body { margin: 0; padding: 1.5rem 1rem; background: #f5f6f8; color: #1c1f23;
+body { margin: 0; padding: 0; background: #f5f6f8; color: #1c1f23;
   font-family: "Noto Sans TC", "Microsoft JhengHei", system-ui, sans-serif; line-height: 1.6; }
-main { max-width: 40rem; margin: 0 auto; background: #fff; border-radius: .75rem;
-  padding: 1.25rem 1.5rem 1.75rem; box-shadow: 0 1px 4px rgba(0,0,0,.12); }
+/* 兩欄外框：側欄固定寬、主內容吃剩餘空間。整組置中，避免超寬螢幕上被拉到兩端。 */
+.layout { display: flex; align-items: flex-start; gap: 1.5rem;
+  max-width: 60rem; margin: 0 auto; padding: 1.5rem 1rem; }
+/* min-width:0 讓 flex 主內容能正常收縮（否則長字串/表格會把版面撐破）。
+   main 從原本的 margin:0 auto 置中改成 flex 子項，白底卡片視覺原樣保留。 */
+main { flex: 1 1 auto; min-width: 0; max-width: 40rem; margin: 0; background: #fff;
+  border-radius: .75rem; padding: 1.25rem 1.5rem 1.75rem; box-shadow: 0 1px 4px rgba(0,0,0,.12); }
+.sidebar { flex: 0 0 15rem; background: #eef0f3; border-right: 1px solid #dde1e6;
+  border-radius: .75rem; padding: 1.1rem 1rem; }
+.brand { padding-bottom: .9rem; margin-bottom: .6rem; border-bottom: 1px solid #dde1e6; }
+.brand-name { font-size: 1.05rem; font-weight: 700; }
+.brand-sub { font-size: .82rem; color: #5a6068; margin-top: .15rem; }
+.brand-ver { font-size: .78rem; color: #8a9099; margin-top: .35rem; }
+.nav { display: flex; flex-direction: column; gap: .2rem; }
+.nav-item { display: block; padding: .5rem .6rem; border-radius: .4rem; color: #1c1f23;
+  text-decoration: none; border-left: 3px solid transparent; font-size: .92rem; }
+.nav-item:hover { background: #e2e5ea; }
+/* active 用紅色 accent（#b3261e，與「危險/送出」按鈕同一支色）+ 左側色條 + 粗體，
+   仿參考站的紅點高亮。 */
+.nav-item.active { background: #fdecea; border-left-color: #b3261e; color: #b3261e; font-weight: 700; }
+.side-status { margin-top: 1rem; padding-top: .7rem; border-top: 1px solid #dde1e6;
+  font-size: .82rem; color: #4a5058; }
+/* 窄視窗（手機）時側欄堆疊到主內容上方，右邊界線改成下邊界線。 */
+@media (max-width: 640px) {
+  .layout { flex-direction: column; }
+  .sidebar { flex: 1 1 auto; width: 100%; border-right: 0; border-bottom: 1px solid #dde1e6; }
+}
 h1 { font-size: 1.2rem; margin: 0 0 .25rem; }
 h2 { font-size: 1rem; margin: 1.25rem 0 .5rem; }
 p { margin: .5rem 0; }
@@ -127,8 +159,19 @@ _SEGMENT_SCRIPT = """
 """
 
 
-def _page(title: str, body_html: str, *, script: str = "", script_nonce: str = "") -> str:
+def _page(
+    title: str,
+    body_html: str,
+    *,
+    script: str = "",
+    script_nonce: str = "",
+    active_nav: str = "sms",
+) -> str:
     """組出完整 HTML 文件。``title`` 一律跳脫；``body_html`` 由呼叫端負責已跳脫。
+
+    ``active_nav`` 決定左側側欄哪個入口高亮。預設 ``"sms"`` 是刻意的：既有所有
+    呼叫端（發送流程的每一頁）都屬於 SMS 流程，不必逐一改就自動歸類並高亮第一個
+    入口；只有 :func:`render_trial_email_stub` 需要顯式傳 ``"trial"``。
 
     ``noindex`` 是防呆：這個服務未來會掛上 Cloudflare Tunnel，萬一 Access 設定
     出包而被公開，至少不要被搜尋引擎收錄成「免費簡訊發送器」。
@@ -153,12 +196,44 @@ def _page(title: str, body_html: str, *, script: str = "", script_nonce: str = "
         f"<style>{_STYLE}</style>\n"
         "</head>\n"
         "<body>\n"
+        '<div class="layout">\n'
+        f'<aside class="sidebar">{_sidebar(active_nav)}</aside>\n'
         "<main>\n"
         f"{body_html}\n"
         "</main>\n"
+        "</div>\n"
         f"{script_block}"
         "</body>\n"
         "</html>\n"
+    )
+
+
+def _sidebar(active_nav: str) -> str:
+    """左側導覽側欄。全站每一頁共用；``active_nav`` 命中的入口高亮。
+
+    版本號與發布日雖是寫死常數，插值仍一律過 :func:`_e` —— 不為自家常數開特例，
+    以免哪天它們改成讀 build 資訊或環境變數時，這裡忘了補跳脫（同本檔其他插值點的規則）。
+
+    只有**兩個**入口是定案需求，不是還沒寫完：發送流程與（尚未實作的）郵件數據寄送。
+    底部狀態只寫「服務：運行中」——本專案沒有任何資料庫，不擺 SQLite/MySQL 之類的
+    假狀態燈，憑空編一個沒有的元件狀態比不顯示更糟。
+    """
+    nav_items = [
+        ("sms", "/", "📤 發送三竹簡訊"),
+        ("trial", "/trial-email", "📧 14天用戶體驗-郵件數據寄送"),
+    ]
+    links = []
+    for key, href, label in nav_items:
+        css_class = "nav-item active" if key == active_nav else "nav-item"
+        links.append(f'<a class="{css_class}" href="{_e(href)}">{_e(label)}</a>\n')
+    return (
+        '<div class="brand">\n'
+        '<div class="brand-name">📱 三竹簡訊工具</div>\n'
+        '<div class="brand-sub">加我科技內部發送介面</div>\n'
+        f'<div class="brand-ver">v{_e(APP_VERSION)} ・ {_e(APP_RELEASE_DATE)}</div>\n'
+        "</div>\n"
+        f'<nav class="nav">\n{"".join(links)}</nav>\n'
+        '<div class="side-status">服務：運行中</div>\n'
     )
 
 
@@ -694,3 +769,25 @@ def render_status_result(
     parts.append(_back_link())
 
     return _page("投遞狀態", "".join(parts))
+
+
+# --------------------------------------------------------------------------- #
+# 14 天用戶體驗－郵件數據寄送（目前僅占位，尚未實作寄信本體）
+# --------------------------------------------------------------------------- #
+
+
+def render_trial_email_stub() -> str:
+    """「14 天用戶體驗－郵件數據寄送」占位頁（``GET /trial-email``）。
+
+    做成占位頁而不是留 404，是為了讓側欄第二個入口點得進來：使用者看得到這個功能
+    存在、只是還沒好，而不是點了掉進死連結。這頁純唯讀、無任何表單、不寄任何郵件、
+    不花錢 —— 寄信本體是之後的工作，這裡刻意不碰。
+    """
+    body = _box(
+        "warn",
+        "🚧 功能建置中",
+        "<p>「14 天用戶體驗－郵件數據寄送」尚未實作。</p>\n"
+        "<p>這個功能將用於寄送 14 天體驗用戶的郵件數據；目前僅為占位頁面，"
+        "不會寄出任何郵件，也不會產生任何費用。</p>\n",
+    )
+    return _page("14天用戶體驗-郵件數據寄送", body, active_nav="trial")

@@ -832,6 +832,12 @@ class SmsWebApp:
             return (
                 self.handle_status(query) if method == "GET" else self._method_not_allowed()
             )
+        if path == "/trial-email":
+            # 放在 _deny_without_access_email 之後，所以占位頁一樣受 Access 保護
+            # （這正是要的：整個介面只要設了 Access 就不該有任何頁面漏在外面）。
+            return (
+                self.handle_trial_email() if method == "GET" else self._method_not_allowed()
+            )
         return self._not_found()
 
     def _deny_without_access_email(self, headers: Any) -> Response | None:
@@ -920,6 +926,15 @@ class SmsWebApp:
             rate_limit=snapshot.limit,
         )
         return _html_response(status, markup, nonce=nonce)
+
+    def handle_trial_email(self) -> Response:
+        """「14 天用戶體驗－郵件數據寄送」占位頁（``GET /trial-email``）。
+
+        目前只回一個「建置中」的靜態頁，尚未實作寄信本體。它在
+        :meth:`_deny_without_access_email` **之後**才被路由到（見 :meth:`route`），
+        所以設了 Access 檢查時一樣擋。此頁沒有任何 ``<script>``，故不需要也不發 nonce。
+        """
+        return _html_response(HTTPStatus.OK, templates.render_trial_email_stub())
 
     def handle_preview(self, form: Mapping[str, Sequence[str]]) -> Response:
         """確認頁。所有「會被擋下」的情況都在這裡擋，不留到 ``/send`` 才報錯。"""
