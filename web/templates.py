@@ -421,7 +421,7 @@ def render_form(
     而該 nonce 必須與同一個回應的 CSP 標頭一致（且每個回應都要換一組新的），
     所以只有產生回應的那一層能決定它，樣板不該自己編一個。
     """
-    parts = ["<h1>三竹簡訊發送</h1>\n"]
+    parts = ["<h1>addwii 簡訊發送</h1>\n"]
     parts.append(
         '<p class="muted">每則扣 1 點，點數與 App 團隊共用（App 靠同一池發註冊驗證碼）。'
         "送出前會先出確認頁。</p>\n"
@@ -460,7 +460,7 @@ def render_form(
     )
 
     return _page(
-        "三竹簡訊發送", "".join(parts), script=_SEGMENT_SCRIPT, script_nonce=script_nonce
+        "addwii 簡訊發送", "".join(parts), script=_SEGMENT_SCRIPT, script_nonce=script_nonce
     )
 
 
