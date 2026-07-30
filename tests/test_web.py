@@ -2249,3 +2249,62 @@ def test_dropdown_rejects_untrusted_id_and_empty_book_falls_back_to_manual(
     assert "名單尚未同步" in form_text
     assert '<select name="recipient_id"' not in form_text
     assert send_once(manual_app).status == HTTPStatus.OK
+
+
+# --------------------------------------------------------------------------- #
+# 16. 訊息範本 radio 快選（v0.003：純前端便利功能，不動送出邏輯）
+# --------------------------------------------------------------------------- #
+
+
+def test_form_renders_three_message_template_radios() -> None:
+    """表單頁要出三個共用 name="sms-template" 的 radio，各帶 label 文字與 value。
+
+    三個範本（出貨／體驗結束／濾網更換）是定案需求，數量與文字都鎖住 —— 少一個或
+    改名都代表 MESSAGE_TEMPLATES 被動到，這裡就該轉紅。
+    """
+    html = templates.render_form(max_segments=5, chars_per_segment=70, script_nonce="n")
+
+    # 三個 radio 共用 name（天然單選互斥），且 fieldset legend 存在。
+    assert html.count('name="sms-template"') == 3
+    assert "訊息範本（選一個自動帶入，仍可修改）" in html
+    # 三個 label 文字。
+    for label in ("出貨通知", "14天體驗結束通知", "濾網更換通知"):
+        assert label in html
+    # 三個 value（送出時 radio 的值，純前端用途）。
+    for value in ("ship", "trial_end", "filter"):
+        assert f'value="{value}"' in html
+
+
+def test_template_radios_escape_body_into_data_attribute() -> None:
+    """範本 body 進 data-body 屬性前必須過 _e —— 否則哪天改讀外部來源就是屬性注入。
+
+    直接餵一段惡意 body（含 <script>、雙引號、& 符號）給 helper：輸出不得含活的
+    `<script>alert`（會變成頁面上真的執行的腳本），而應是跳脫後的實體。這是回歸鎖：
+    現況安全（body 都包著 _e），存在的意義是「拿掉那個 _e 之後這條會轉紅」。
+    """
+    out = templates._template_radios(
+        [{"key": "x", "label": "惡意", "body": '<script>alert(1)</script>"&'}]
+    )
+
+    # 活的 script 標籤不得原樣出現在 data-body 裡。
+    assert "<script>alert" not in out
+    # 角括號、雙引號、& 都要以跳脫形式存在（證明 body 過了 _e）。
+    assert "&lt;script&gt;" in out
+    assert "&quot;" in out
+    assert "&amp;" in out
+
+
+def test_template_autofill_wired_via_addeventlistener_and_single_script() -> None:
+    """帶入邏輯要接上（腳本引用 sms-template）且用 addEventListener（CSP 相容，非 inline）。
+
+    另鎖「本頁仍只有一支帶 nonce 的 <script>」：CSP 的 script-src 是 'nonce-…'，多開
+    第二支未帶 nonce 的腳本會被瀏覽器擋掉，也違反本功能「只擴充既有那支腳本」的約束。
+    """
+    # 帶入邏輯存在，且以事件監聽（非 inline onclick）掛上。
+    assert "sms-template" in templates._SEGMENT_SCRIPT
+    assert "addEventListener" in templates._SEGMENT_SCRIPT
+
+    html = templates.render_form(max_segments=5, chars_per_segment=70, script_nonce="n")
+    # 全頁只有一支 <script>（就是帶 nonce 的那支），沒有新增第二支。
+    assert html.count("<script") == 1
+    assert '<script nonce="n">' in html

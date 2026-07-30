@@ -137,7 +137,55 @@ dd { margin: 0; word-break: break-all; }
 .muted { color: #5a6068; font-size: .9rem; }
 .back { display: inline-block; margin-top: 1.25rem; color: #1a56b5; }
 form.inline { display: inline; }
+/* 訊息範本快選：輕量卡片式 fieldset，沿用側欄同一組灰底/邊框色，不引入外部資源。 */
+.templates { margin: 1rem 0 .25rem; padding: .6rem .9rem .8rem; border: 1px solid #dde1e6;
+  border-radius: .5rem; background: #f5f6f8; }
+.templates legend { font-weight: 700; font-size: .9rem; color: #4a5058; padding: 0 .35rem; }
+/* 每個 radio 佔一行、整塊可點（label 包住 input），行距足夠避免手機上誤觸。 */
+.templates .tmpl { display: block; font-weight: 400; margin: .35rem 0; cursor: pointer; }
+.templates .tmpl input { margin-right: .45rem; cursor: pointer; }
 """
+
+# 訊息範本的**單一真相來源**。radio 快選與（未來若需要的）測試都從這裡取值，
+# 不各自寫死字串。body 內容是定案文案（addwii 出貨／體驗結束／濾網更換三種通知），
+# 一字不改 —— 改文案只改這一處。key 是送出時 radio 的 value，純前端用途：伺服器端
+# 只讀 phone/recipient_id/body，完全不看 sms-template 這個欄位（見 render_form docstring）。
+MESSAGE_TEMPLATES = [
+    {"key": "ship", "label": "出貨通知",
+     "body": "【addwii】您訂購的空氣清淨機已出貨，預計 2–3 個工作天送達，屆時請留意收件。如有問題歡迎與我們聯繫。"},
+    {"key": "trial_end", "label": "14天體驗結束通知",
+     "body": "【addwii】您的 14 天體驗即將結束，感謝您的試用！如需續購或有任何疑問，歡迎隨時與我們聯繫。"},
+    {"key": "filter", "label": "濾網更換通知",
+     "body": "【addwii】提醒您，您的濾網使用已達建議更換週期，為維持最佳空氣品質，請盡快更換濾網。謝謝！"},
+]
+
+
+def _template_radios(templates: list[dict]) -> str:
+    """訊息範本快選的一組單選 radio（fieldset）。
+
+    抽成獨立函式（而非塞進 render_form）是為了能被單元測試直接餵惡意 body 驗跳脫：
+    範本內容雖然目前都是自家定案文案，但 body 會進到 ``data-body`` **HTML 屬性**，
+    只要哪天改成讀外部來源、又漏了 :func:`_e`，就是屬性注入。所以這裡與本檔其他插值點
+    同一條規則 —— key/label/body 全部過 :func:`_e`，不為自家常數開特例。
+
+    radio 共用 ``name="sms-template"`` → 瀏覽器天然單選互斥，同時只有一個能選中。
+    帶入下方 ``#sms-body`` 的行為由 :data:`_SEGMENT_SCRIPT` 以 ``addEventListener``
+    掛上（CSP 相容，不用 inline onclick）；本函式只做字串組裝、不碰任何 I/O。
+    """
+    labels = []
+    for tmpl in templates:
+        labels.append(
+            '<label class="tmpl">'
+            f'<input type="radio" name="sms-template" value="{_e(tmpl["key"])}" '
+            f'data-body="{_e(tmpl["body"])}"> {_e(tmpl["label"])}</label>\n'
+        )
+    return (
+        '<fieldset class="templates">\n'
+        "<legend>訊息範本（選一個自動帶入，仍可修改）</legend>\n"
+        f"{''.join(labels)}"
+        "</fieldset>\n"
+    )
+
 
 # 即時試算則數的腳本。刻意寫成完全靜態（參數走 data-* 屬性），
 # 這樣就不必把任何值插進 <script> 裡 —— 少一個 XSS 破口。
@@ -146,6 +194,11 @@ form.inline { display: inline; }
 # 中文沒差但 emoji 會多算一倍，畫面上顯示的扣點數就會跟 mitake.count_sms_segments
 # （算 Python 的 code point）對不起來。畫面試算只是提示，真正的計費以伺服器端為準，
 # 但兩邊對不上會讓人不敢相信確認頁上的數字。
+#
+# 尾段的 radio 帶入邏輯用 addEventListener（而非 inline onclick）是 CSP 硬需求：
+# 本頁 script-src 是 'nonce-…' 不含 'unsafe-inline'，inline handler 會被瀏覽器擋掉。
+# 它放在 input/out 的 early return 之後 —— 沒有 #sms-body 就沒有可帶入的目標，
+# 這段自然也不需要跑。
 _SEGMENT_SCRIPT = """
 (function () {
   var input = document.getElementById("sms-body");
@@ -161,6 +214,15 @@ _SEGMENT_SCRIPT = """
     out.className = segments > max ? "cost over" : "cost";
   }
   input.addEventListener("input", update);
+  var radios = document.querySelectorAll('input[type=radio][name=sms-template]');
+  Array.prototype.forEach.call(radios, function (r) {
+    r.addEventListener("change", function () {
+      if (r.checked && typeof r.dataset.body === "string") {
+        input.value = r.dataset.body;
+        update();            // 帶入後立刻重算字數/則數/扣點
+      }
+    });
+  });
   update();
 })();
 """
@@ -440,6 +502,9 @@ def render_form(
     parts.append('<form method="post" action="/preview" accept-charset="UTF-8">\n')
     # 手機號碼欄位：有名單走下拉、沒名單維持手動輸入（見 _recipient_field）。
     parts.append(_recipient_field(recipients, phone))
+    # 訊息範本快選：放在簡訊內容欄之上，選一個 radio 就把預設內容帶入下方 textarea
+    # （帶入由 _SEGMENT_SCRIPT 掛 change 監聽處理）。純前端便利功能，不影響送出邏輯。
+    parts.append(_template_radios(MESSAGE_TEMPLATES))
     parts.append('<label for="sms-body">簡訊內容</label>\n')
     parts.append(
         f'<textarea id="sms-body" name="body" data-per-segment="{int(chars_per_segment)}" '
