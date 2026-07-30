@@ -21,7 +21,14 @@
 from __future__ import annotations
 
 from html import escape as _e
+from typing import TYPE_CHECKING
 from urllib.parse import quote as _q
+
+if TYPE_CHECKING:
+    # 只給型別檢查用：本檔在**執行期**刻意不 import web.recipients，維持與「不 import
+    # mitake」同一套克制（見 _STATUS_TONE 註解）。渲染時只靠 duck typing 呼叫 book 的
+    # all()/selectable()/is_empty()/generated_at，不需要真的持有那個類別。
+    from web.recipients import RecipientBook
 
 # 版本常數的唯一來源在 web/__init__.py。templates 是以 web.templates 被匯入的，
 # 匯入本模組時 web 套件的 __init__ 早已執行完，所以這裡讀 web.__version__ 是安全的
@@ -268,6 +275,68 @@ def _hidden_resend_form(phone: str, body: str, label: str) -> str:
     )
 
 
+def _mask_recipient_phone(phone: str | None) -> str:
+    """遮罩顯示號碼：保留前 4、後 2，中間以 ``***`` 取代（例 ``0918123456`` → ``0918***56``）。
+
+    下拉選單只是給操作者「認出是誰」用，不需要把整串號碼攤在畫面上（會被肩窺、會被
+    截圖外流）。真正要送到的號碼從不經過前端，一律在伺服器端以 id 反查（見
+    ``web.server.handle_preview``），所以這裡遮掉不影響任何功能。
+
+    與 :func:`web.audit.mask_phone`（保留後 4 碼）刻意不同：那是稽核留底的格式，
+    這是畫面辨識的格式，兩者用途不同、不共用。太短（不足 7 碼）就原樣顯示 ——
+    正常台灣手機是 10 碼，會走到這裡的短號碼是髒資料，別 crash 即可。
+    """
+    text = phone or ""
+    if len(text) <= 6:
+        return text
+    return f"{text[:4]}***{text[-2:]}"
+
+
+def _recipient_field(book: "RecipientBook | None", phone: str) -> str:
+    """手機號碼欄位：有名單走下拉、沒名單維持手動輸入。
+
+    **這是整個功能「不破壞現況」的關鍵所在。** ``book`` 為 ``None`` 或空時，輸出與
+    改造前**逐字一致**的手動 ``<input name="phone">``（既有 114 個回歸測試全走這條，
+    一個字都不能動），只多一行「名單尚未同步」的說明。只有 book 非空時才改出
+    ``<select name="recipient_id">``。
+    """
+    if book is None or book.is_empty():
+        # 現況路徑：手動輸入。這段 HTML 必須與改造前完全相同。
+        return (
+            '<label for="sms-phone">手機號碼</label>\n'
+            '<input type="tel" id="sms-phone" name="phone" autocomplete="off" '
+            'inputmode="numeric" placeholder="09xxxxxxxx" '
+            f'value="{_e(phone)}">\n'
+            '<p class="muted">名單尚未同步，可手動輸入號碼。</p>\n'
+        )
+
+    # 有名單：改出下拉。第一個 option 是不可送出的提示（disabled + selected），逼使用者
+    # 主動選一個，避免「沒選就送出預設第一筆」的手滑扣點。
+    options = ['<option value="" disabled selected>請選擇發送對象</option>\n']
+    for rec in book.all():
+        if rec.is_selectable:
+            options.append(
+                f'<option value="{_e(rec.id)}">'
+                f"{_e(rec.name)}（{_e(_mask_recipient_phone(rec.phone))}）</option>\n"
+            )
+        else:
+            # ambiguous / not_found：讓操作者**看得到但選不了**（disabled 沒有 value，
+            # 送不出去）。看不到的話操作者會以為名單漏人、跑去手動硬塞號碼，那正是要防的。
+            options.append(
+                f"<option disabled>{_e(rec.name)}（查無電話／多筆相符，不可選）</option>\n"
+            )
+    # name="recipient_id" 放在最前面：伺服器端只認這個欄位，前端送來的 phone 一律忽略。
+    field = (
+        '<label for="sms-recipient">發送對象</label>\n'
+        '<select name="recipient_id" id="sms-recipient" required>\n'
+        f"{''.join(options)}"
+        "</select>\n"
+    )
+    if book.generated_at:
+        field += f'<p class="muted">名單同步於 {_e(book.generated_at)}</p>\n'
+    return field
+
+
 def status_query_url(msgid: str) -> str:
     """組出「查這則 msgid 的投遞狀態」的網址。
 
@@ -338,8 +407,12 @@ def render_form(
     notice: str | None = None,
     rate_used: int | None = None,
     rate_limit: int | None = None,
+    recipients: "RecipientBook | None" = None,
 ) -> str:
     """表單頁（``GET /``，以及各種被擋下時的回填頁）。
+
+    ``recipients`` 非空時，手機號碼欄位改成發送對象下拉選單（號碼在伺服器端反查）；
+    ``None`` 或空名單時維持手動輸入號碼 —— 這是預設，確保沒設定名單的既有行為不變。
 
     ``phone`` / ``body`` 是使用者上次填的內容 —— 被擋下時原樣回填，
     否則使用者得整段重打，而重打長訊息本身就是打錯字、送錯人的來源。
@@ -365,12 +438,8 @@ def render_form(
         )
 
     parts.append('<form method="post" action="/preview" accept-charset="UTF-8">\n')
-    parts.append('<label for="sms-phone">手機號碼</label>\n')
-    parts.append(
-        '<input type="tel" id="sms-phone" name="phone" autocomplete="off" '
-        'inputmode="numeric" placeholder="09xxxxxxxx" '
-        f'value="{_e(phone)}">\n'
-    )
+    # 手機號碼欄位：有名單走下拉、沒名單維持手動輸入（見 _recipient_field）。
+    parts.append(_recipient_field(recipients, phone))
     parts.append('<label for="sms-body">簡訊內容</label>\n')
     parts.append(
         f'<textarea id="sms-body" name="body" data-per-segment="{int(chars_per_segment)}" '
@@ -396,9 +465,18 @@ def render_form(
 
 
 def render_preview(
-    *, phone: str, body: str, segments: int, chars: int, token: str
+    *,
+    phone: str,
+    body: str,
+    segments: int,
+    chars: int,
+    token: str,
+    recipient_name: str | None = None,
 ) -> str:
     """確認頁（``POST /preview`` 的回應）。按下這頁的按鈕才會真的花錢。
+
+    ``recipient_name`` 有值（下拉選單模式）時，在明細多顯示一列「收件人」，讓操作者
+    在按下送出前，號碼與姓名兩者都能對一次。它只是顯示，號碼仍以 token 內的 phone 為準。
 
     表單裡**只帶 token**，不帶號碼與內容 —— 兩者留在伺服器端的 token 內容裡。
     若把它們也放進 hidden input，使用者（或中間人）就能在確認頁之後改掉收件人，
@@ -414,6 +492,8 @@ def render_preview(
     )
     parts.append("<dl>\n")
     parts.append(f"<dt>收件號碼</dt><dd>{_e(phone)}</dd>\n")
+    if recipient_name:
+        parts.append(f"<dt>收件人</dt><dd>{_e(recipient_name)}</dd>\n")
     parts.append(f"<dt>字數／則數</dt><dd>{chars} 字 ／ {segments} 則</dd>\n")
     parts.append(f"<dt>將扣點數</dt><dd><strong>{segments} 點</strong></dd>\n")
     parts.append("</dl>\n")
@@ -439,8 +519,12 @@ def render_sent(
     msgid: str | None,
     account_point: int | None,
     audit_ok: bool = True,
+    recipient_name: str | None = None,
 ) -> str:
     """成功頁（``POST /send`` 成功）。
+
+    ``recipient_name`` 有值（下拉選單模式）時多顯示一行「已發送給 {姓名}」，讓操作者
+    確認送到的是選定的那個人。純顯示，不影響任何邏輯。
 
     刻意**不放任何送出按鈕**：使用者在成功頁上唯一該做的事是離開。
     多一個「再送一次」的捷徑，就多一個手滑扣點的機會。
@@ -456,6 +540,8 @@ def render_sent(
     parts.append(
         _box("ok", "三竹已接收", f"<p>{_e(phone)}，{chars} 字／{segments} 則，扣 {segments} 點。</p>\n")
     )
+    if recipient_name:
+        parts.append(f'<p class="muted">已發送給 {_e(recipient_name)}。</p>\n')
     parts.append("<dl>\n")
     parts.append(
         f'<dt>msgid</dt><dd><span class="msgid">{_e(msgid) if msgid else "（三竹未回傳）"}</span></dd>\n'

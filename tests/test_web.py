@@ -61,6 +61,7 @@ import mitake  # noqa: E402
 
 from web import templates  # noqa: E402
 from web.audit import AuditLog  # noqa: E402
+from web.recipients import Recipient, RecipientBook  # noqa: E402
 from web.server import (  # noqa: E402
     ACCESS_EMAIL_HEADER,
     SmsWebApp,
@@ -223,8 +224,14 @@ def make_app(
     require_access_email: str | None = None,
     status_query: "RecordingStatusQuery | None" = None,
     status_query_limit: int = 30,
+    recipient_source: "Callable[[], RecipientBook] | None" = None,
 ) -> SmsWebApp:
-    """建一個完全離線的 app：假 sender、假 status_query、假時鐘、稽核檔落在 tmp_path。"""
+    """建一個完全離線的 app：假 sender、假 status_query、假時鐘、稽核檔落在 tmp_path。
+
+    ``recipient_source`` 預設 None：既有呼叫端不傳，走 SmsWebApp 的預設（空名單、
+    手機號碼手動輸入模式），既有測試因此完全不受下拉選單功能影響。下拉相關的測試
+    自己注入一個回傳記憶體內 RecipientBook 的 source。
+    """
     return SmsWebApp(
         sender=sender,
         status_query=status_query,
@@ -240,6 +247,44 @@ def make_app(
         clock=clock if clock is not None else FakeClock(),
         request_id_factory=lambda: "req-test",
         require_access_email=require_access_email,
+        recipient_source=recipient_source,
+    )
+
+
+def sample_recipient_book() -> RecipientBook:
+    """一份記憶體內名單：1 筆 ok（可選）+ 1 筆 ambiguous + 1 筆 not_found（皆不可選）。
+
+    刻意涵蓋三種 match_status，讓下拉測試同時驗到「可選者能選」與「不可選者灰掉但看得到」。
+    ok 那筆的電話是合法的 09 開頭 10 碼（過得了 mitake.validate_phone）。
+    """
+    return RecipientBook(
+        [
+            Recipient(
+                id="u46",
+                name="陳筱琪",
+                phone="0918123424",
+                device="體驗活動14天-陳筱琪4c74",
+                borrow_date="2026-07-29",
+                match_status="ok",
+            ),
+            Recipient(
+                id="u43",
+                name="青蘋果",
+                phone=None,
+                device="體驗活動14天-青蘋果",
+                borrow_date="2026-07-20",
+                match_status="ambiguous",
+            ),
+            Recipient(
+                id="loan-x",
+                name="青化活動中心",
+                phone=None,
+                device="體驗活動14天-青化",
+                borrow_date="2026-07-18",
+                match_status="not_found",
+            ),
+        ],
+        generated_at="2026-07-30T11:00:00+08:00",
     )
 
 
@@ -2103,3 +2148,104 @@ def test_live_server_passes_the_query_string_to_the_status_page(tmp_path: Path) 
         {"msgid": "0315772761", "timeout": pytest.approx(25.0)}
     ]
     assert "已送達手機" in html
+
+
+# --------------------------------------------------------------------------- #
+# 19. 發送對象下拉選單（Part B：id → 電話伺服器端解析、不信任前端、無名單退回手動）
+# --------------------------------------------------------------------------- #
+
+
+def test_recipient_dropdown_renders_with_disabled_unselectable_entries(
+    tmp_path: Path,
+) -> None:
+    """注入名單後，表單出下拉：可選者帶遮罩電話與姓名，ambiguous / not_found 灰掉但看得到。
+
+    「看得到但選不了」是刻意的 —— 看不到的話操作者會以為名單漏人、跑去手動硬塞號碼，
+    那正是這個功能要防的（手動輸入正是打錯字、送錯人的來源）。
+    """
+    book = sample_recipient_book()
+    app = make_app(tmp_path, RecordingSender(), recipient_source=lambda: book)
+
+    text = app.route("GET", "/").text
+
+    # 下拉本體 + 可選者（含遮罩電話與姓名）。
+    assert '<select name="recipient_id"' in text
+    assert '<option value="u46"' in text
+    assert "陳筱琪" in text
+    assert "0918***24" in text  # 遮罩：前 4 後 2，中間 ***
+    # ambiguous / not_found：出現在畫面上（看得到姓名）但為 disabled option（選不了）。
+    assert "<option disabled>" in text
+    assert "青蘋果" in text
+    assert "青化活動中心" in text
+    # 名單新舊程度的提示。
+    assert "名單同步於" in text
+    # 真實號碼不可整串暴露在下拉裡（只給遮罩版）。
+    assert "0918123424" not in text
+
+
+def test_preview_resolves_phone_from_id_and_ignores_front_end_phone(
+    tmp_path: Path,
+) -> None:
+    """下拉模式：號碼由伺服器端以 id 反查，**忽略**前端另外送來的假 phone（防竄改核心）。
+
+    故意在 POST 裡同時塞 recipient_id=u46 與一個假 phone=0900000000：確認頁與實際
+    送出的號碼都必須是名單裡 u46 的真號碼（0918123424）與姓名（陳筱琪），
+    絕不是那個假號碼。且 token 有正常發出（走得完二階段）。
+    """
+    book = sample_recipient_book()
+    sender = RecordingSender()
+    app = make_app(tmp_path, sender, recipient_source=lambda: book)
+
+    preview = app.route(
+        "POST",
+        "/preview",
+        _form(recipient_id="u46", phone="0900000000", body=SHORT_BODY),
+    )
+
+    assert preview.status == HTTPStatus.OK
+    assert "0918123424" in preview.text  # 名單裡的真號碼
+    assert "陳筱琪" in preview.text  # 收件人姓名
+    assert "0900000000" not in preview.text  # 前端塞的假號碼被無視
+    match = _TOKEN_PATTERN.search(preview.text)
+    assert match is not None, "確認頁沒有 token，下拉模式的二階段確認壞了"
+
+    sent = app.route("POST", "/send", _form(token=match.group(1)))
+
+    assert sent.status == HTTPStatus.OK
+    assert sender.call_count == 1
+    assert sender.calls[0]["phone"] == "0918123424"  # 真的送到的是伺服器端解析的號碼
+    assert "已發送給 陳筱琪" in sent.text
+
+
+def test_dropdown_rejects_untrusted_id_and_empty_book_falls_back_to_manual(
+    tmp_path: Path,
+) -> None:
+    """(a) 不可選 / 未知 id 一律擋在確認頁前（不發 token、不送出）；(b) 空名單退回手動輸入。
+
+    (a) 是防竄改的另一半：前端送 not_found / ambiguous / 根本不存在的 id 過來，
+    伺服器端 book.get() 都回 None → 400，token 不發、簡訊不送。
+    (b) 確保「沒設定名單」時行為與現況完全一致：仍是手動 `<input name="phone">`，
+    且既有的手動 preview→send 流程照常走得完。
+    """
+    book = sample_recipient_book()
+    sender = RecordingSender()
+    app = make_app(tmp_path, sender, recipient_source=lambda: book)
+
+    # (a) not_found / ambiguous / 未知 id 都要被擋下。
+    for bad_id in ("loan-x", "u43", "does-not-exist"):
+        response = app.route(
+            "POST", "/preview", _form(recipient_id=bad_id, body=SHORT_BODY)
+        )
+        assert response.status == HTTPStatus.BAD_REQUEST, bad_id
+        assert _TOKEN_PATTERN.search(response.text) is None, bad_id
+        assert "重新選擇" in response.text
+    assert app.token_store.pending_count == 0
+    assert sender.call_count == 0
+
+    # (b) 空名單（不注入 recipient_source）→ 手動輸入，且流程照常。
+    manual_app = make_app(tmp_path, RecordingSender())
+    form_text = manual_app.route("GET", "/").text
+    assert '<input type="tel" id="sms-phone" name="phone"' in form_text
+    assert "名單尚未同步" in form_text
+    assert '<select name="recipient_id"' not in form_text
+    assert send_once(manual_app).status == HTTPStatus.OK

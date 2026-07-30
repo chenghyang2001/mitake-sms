@@ -80,6 +80,7 @@ if _REPO_ROOT not in sys.path:
 
 import mitake  # noqa: E402  （必須等 sys.path 補完才 import）
 
+from web import recipients  # noqa: E402
 from web import templates  # noqa: E402
 from web.audit import DEFAULT_TAIL_LINES, AuditLog, mask_phone  # noqa: E402
 
@@ -155,6 +156,11 @@ ENV_MAX_SEGMENTS = "MITAKE_WEB_MAX_SEGMENTS"
 ENV_LOG_LEVEL = "MITAKE_WEB_LOG_LEVEL"
 ENV_REQUIRE_ACCESS_EMAIL = "MITAKE_WEB_REQUIRE_ACCESS_EMAIL"
 ENV_STATUS_QUERY_LIMIT = "MITAKE_WEB_STATUS_QUERY_LIMIT"
+
+# 發送對象名單 JSON 檔路徑。有設才啟用「下拉選單」模式，沒設就維持手動輸入號碼
+# （＝現況行為，確保既有回歸測試不受影響）。名單由另一支 producer 產出，見
+# web/recipients.py；本服務每次載入表單都重讀此檔，producer 更新後不必重啟。
+ENV_RECIPIENTS_PATH = "MITAKE_WEB_RECIPIENTS_PATH"
 
 # Cloudflare Access 通過認證後注入的身分標頭。**這個值可以被偽造**（真正可驗的是
 # Cf-Access-Jwt-Assertion 的簽章，但驗它要拉 JWKS＝破壞零外部依賴），
@@ -414,6 +420,11 @@ class PendingSend:
     segments: int
     chars: int
     issued_at: float
+    # 下拉選單模式下，這則簡訊選定的發送對象姓名（手動輸入模式為 None）。放最後且
+    # 帶預設值，是 frozen dataclass 新增欄位的相容做法 —— 既有以位置或關鍵字建構
+    # PendingSend 的地方（都在 TokenStore.issue）不必改。只拿來在確認頁／成功頁多顯示
+    # 一行「收件人」，不參與任何發送邏輯，號碼仍以 phone 為唯一依據。
+    recipient_name: str | None = None
 
 
 class TokenError(Exception):
@@ -470,13 +481,31 @@ class TokenStore:
         for key in expired:
             del self._tokens[key]
 
-    def issue(self, *, phone: str, body: str, segments: int, chars: int) -> str:
-        """產生一次性 token 並記住待送內容。"""
+    def issue(
+        self,
+        *,
+        phone: str,
+        body: str,
+        segments: int,
+        chars: int,
+        recipient_name: str | None = None,
+    ) -> str:
+        """產生一次性 token 並記住待送內容。
+
+        ``recipient_name`` 是選填的顯示用姓名（下拉選單模式才有值），選填是為了讓
+        既有手動輸入路徑不必傳它；它只跟著 :class:`PendingSend` 走到確認頁／成功頁
+        顯示，不影響發送 —— 真正送到哪個號碼永遠由 ``phone`` 決定。
+        """
         now = self._clock()
         # 32 bytes = 256 bit 熵。urlsafe 才能安全塞進 HTML 屬性與表單欄位。
         token = secrets.token_urlsafe(32)
         pending = PendingSend(
-            phone=phone, body=body, segments=segments, chars=chars, issued_at=now
+            phone=phone,
+            body=body,
+            segments=segments,
+            chars=chars,
+            issued_at=now,
+            recipient_name=recipient_name,
         )
         with self._lock:
             self._purge(now)
@@ -725,6 +754,7 @@ class SmsWebApp:
         clock: Callable[[], float] = time.monotonic,
         request_id_factory: Callable[[], str] | None = None,
         require_access_email: str | None = None,
+        recipient_source: Callable[[], recipients.RecipientBook] | None = None,
     ) -> None:
         if max_segments < 1:
             raise ValueError(f"單次則數上限必須 >= 1，收到 {max_segments}")
@@ -757,6 +787,18 @@ class SmsWebApp:
         # → 整個介面 403 全掛（或更糟：比對邏輯寫鬆一點就變成誰都放行）。
         cleaned = (require_access_email or "").strip()
         self._required_access_email = cleaned or None
+        # 發送對象名單的來源。可注入（測試餵記憶體內的 book）；沒注入時看環境變數：
+        # 有設路徑 → 每次呼叫都重讀檔（producer 更新名單後不必重啟服務就生效）；
+        # 沒設 → 一律回空名單，表單退回手動輸入號碼＝現況行為（既有測試不受影響）。
+        if recipient_source is not None:
+            self._recipient_source = recipient_source
+        else:
+            env_path = os.environ.get(ENV_RECIPIENTS_PATH)
+            if env_path and env_path.strip():
+                path = env_path.strip()
+                self._recipient_source = lambda: recipients.load_recipients(path)
+            else:
+                self._recipient_source = lambda: recipients.RecipientBook.empty()
 
     # -- 唯讀屬性（給啟動訊息與測試用） ------------------------------------- #
 
@@ -785,6 +827,15 @@ class SmsWebApp:
     def status_throttle(self) -> StatusQueryThrottle:
         """投遞狀態查詢的節流器。與 :attr:`rate_limiter`（發送則數）互不相干。"""
         return self._status_throttle
+
+    def _recipients(self) -> recipients.RecipientBook:
+        """取得**當下**的發送對象名單。
+
+        每次呼叫都重新向 source 取值（env 模式下等於重讀檔）—— 這是刻意的：
+        producer 更新名單後，下一次載入表單就會看到新名單，不必重啟服務。
+        名單只在 ``GET /`` 渲染與 ``/preview`` 反查電話時各取一次，成本可忽略。
+        """
+        return self._recipient_source()
 
     # -- 路由 ---------------------------------------------------------------- #
 
@@ -914,6 +965,8 @@ class SmsWebApp:
         # 每次進這個函式都換一組新的 nonce（它同時進頁面與 CSP 標頭，見 _csp_header）。
         # 這是全站唯一帶 <script> 的頁面，所以也是唯一需要 nonce 的地方。
         nonce = _new_nonce()
+        # 取當下名單：非空 → render_form 出下拉選單；空（含未設定）→ 手動輸入（現況）。
+        book = self._recipients()
         markup = templates.render_form(
             max_segments=self._max_segments,
             chars_per_segment=mitake.CHARS_PER_SEGMENT,
@@ -924,6 +977,7 @@ class SmsWebApp:
             notice=notice,
             rate_used=snapshot.used,
             rate_limit=snapshot.limit,
+            recipients=book,
         )
         return _html_response(status, markup, nonce=nonce)
 
@@ -937,15 +991,47 @@ class SmsWebApp:
         return _html_response(HTTPStatus.OK, templates.render_trial_email_stub())
 
     def handle_preview(self, form: Mapping[str, Sequence[str]]) -> Response:
-        """確認頁。所有「會被擋下」的情況都在這裡擋，不留到 ``/send`` 才報錯。"""
-        phone_raw = _first(form, "phone")
+        """確認頁。所有「會被擋下」的情況都在這裡擋，不留到 ``/send`` 才報錯。
+
+        **雙模式**（由 ``recipient_id`` 欄位有無決定，互斥）：
+
+        * 下拉選單模式（``recipient_id`` 非空）：號碼**只由伺服器端**以 id 反查名單
+          取得，**完全忽略**前端另外送來的 ``phone`` 欄位 —— 防竄改的核心，前端改不了
+          真實收件人。查不到可選對象（未知 id / ambiguous / not_found）直接擋在確認頁
+          之前，不發 token、不送出。
+        * 手動輸入模式（``recipient_id`` 為空）：讀 ``phone`` 欄位，與現況完全一致。
+          名單未設定時表單本來就出手動欄位，這條路徑保留給既有行為（既有測試全走這條）。
+        """
         body = _normalize_newlines(_first(form, "body"))
+        recipient_id = _first(form, "recipient_id")
+        recipient_name: str | None = None
+
+        if recipient_id:
+            # 下拉模式：號碼一律由 book.get() 解析，忽略前端送來的 phone（防竄改）。
+            rec = self._recipients().get(recipient_id)
+            if rec is None:
+                # 未知 id、或指向 ambiguous / not_found 的 id：一律擋下，不發 token、
+                # 不送出。回填 phone 傳空（下拉模式靠使用者重選，沒有「上次打的號碼」）。
+                return self.handle_index(
+                    body=body,
+                    error="所選發送對象無法解析或查無電話，請重新選擇。（尚未送出，未扣點）",
+                    status=HTTPStatus.BAD_REQUEST,
+                )
+            phone_raw = rec.phone
+            recipient_name = rec.name
+        else:
+            phone_raw = _first(form, "phone")
+
+        # 下拉模式回填一律傳空號碼（靠重選）；手動模式回填原始輸入（見既有註解的理由）。
+        backfill_phone = "" if recipient_id else phone_raw
 
         try:
+            # 即使下拉解析出來的號碼也要過驗證：users 表可能有髒資料（producer 沒把關），
+            # 不能因為「來自名單」就假設它一定是合法的 09 開頭 10 碼。
             phone = mitake.validate_phone(phone_raw)
         except mitake.MitakeValidationError as exc:
             return self.handle_index(
-                phone=phone_raw,
+                phone=backfill_phone,
                 body=body,
                 error=f"{exc}（尚未送出，未扣點）",
                 status=HTTPStatus.BAD_REQUEST,
@@ -954,7 +1040,7 @@ class SmsWebApp:
         # 三竹會拒收空內容，而且那趟網路來回不會告訴使用者任何有用的事。
         if not body.strip():
             return self.handle_index(
-                phone=phone_raw,
+                phone=backfill_phone,
                 body=body,
                 error="簡訊內容不可為空白（只有空白字元也不行）。",
                 status=HTTPStatus.BAD_REQUEST,
@@ -963,7 +1049,7 @@ class SmsWebApp:
         segments, chars = mitake.count_sms_segments(body)
         if segments > self._max_segments:
             return self.handle_index(
-                phone=phone_raw,
+                phone=backfill_phone,
                 body=body,
                 error=(
                     f"內容 {chars} 字＝{segments} 則＝送出會扣 {segments} 點，"
@@ -979,16 +1065,30 @@ class SmsWebApp:
             # token（表單資料理論上還在瀏覽器的上一頁），但使用者面對 429 頁的
             # 直覺是回表單重打，不是按上一頁 —— 而重打長訊息本身就是打錯字、
             # 送錯人的來源。回填的號碼用正規化後的版本（它已經通過驗證）。
-            return self._rate_limited_response(exc, phone=phone, body=body)
+            # 下拉模式不把號碼帶進重送按鈕（一律空、靠重選）；手動模式沿用正規化號碼。
+            return self._rate_limited_response(
+                exc, phone="" if recipient_id else phone, body=body
+            )
 
-        token = self._tokens.issue(phone=phone, body=body, segments=segments, chars=chars)
+        token = self._tokens.issue(
+            phone=phone,
+            body=body,
+            segments=segments,
+            chars=chars,
+            recipient_name=recipient_name,
+        )
         logger.info(
             "產生確認頁：號碼=%s 則數=%s 字數=%s", mask_phone(phone), segments, chars
         )
         return _html_response(
             HTTPStatus.OK,
             templates.render_preview(
-                phone=phone, body=body, segments=segments, chars=chars, token=token
+                phone=phone,
+                body=body,
+                segments=segments,
+                chars=chars,
+                token=token,
+                recipient_name=recipient_name,
             ),
         )
 
@@ -1440,6 +1540,7 @@ class SmsWebApp:
                 msgid=str(msgid) if msgid is not None else None,
                 account_point=account_point if isinstance(account_point, int) else None,
                 audit_ok=audit_ok,
+                recipient_name=pending.recipient_name,
             ),
         )
 
@@ -1913,6 +2014,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="稽核檔路徑（預設讀 MITAKE_WEB_AUDIT_PATH，再預設 logs/send-audit.jsonl）",
     )
     parser.add_argument(
+        "--recipients-path",
+        default=os.environ.get(ENV_RECIPIENTS_PATH) or None,
+        help=(
+            f"發送對象名單 JSON 檔路徑（預設讀 {ENV_RECIPIENTS_PATH}；不設＝手機號碼"
+            "維持手動輸入）。名單由另一支 producer 產出，本服務每次載入表單都重讀此檔，"
+            "producer 更新後不必重啟。讀不到／格式壞掉時自動降級回手動輸入，不會中斷服務。"
+        ),
+    )
+    parser.add_argument(
         "--allow-public",
         action="store_true",
         help="允許綁定非 loopback 位址。發簡訊會扣共用點數，請先設好 Cloudflare Access 再開。",
@@ -1990,6 +2100,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"錯誤：--port 必須介於 1..65535，收到 {args.port}", file=sys.stderr)
         return 2
 
+    # --recipients-path（預設讀 env）有值才建 source；沒值就交給 SmsWebApp 的預設
+    # （＝空名單、手動輸入模式）。用具名區域變數綁住路徑，避免 late-binding closure 陷阱。
+    recipient_source: Callable[[], recipients.RecipientBook] | None = None
+    if args.recipients_path:
+        recipients_path = args.recipients_path
+
+        def recipient_source() -> recipients.RecipientBook:
+            return recipients.load_recipients(recipients_path)
+
     app = SmsWebApp(
         audit_log=AuditLog(args.audit_path) if args.audit_path else None,
         max_segments=args.max_segments,
@@ -1997,7 +2116,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         status_query_limit=args.status_query_limit,
         token_ttl_seconds=args.token_ttl,
         require_access_email=args.require_access_email,
+        recipient_source=recipient_source,
     )
+
+    if args.recipients_path:
+        logger.info(
+            "發送對象名單：%s（下拉選單模式，每次載入表單重讀；讀不到會自動降級手動輸入）。",
+            args.recipients_path,
+        )
+    else:
+        logger.info("發送對象名單：未設定，手機號碼為手動輸入模式。")
 
     logger.info(
         "設定：單次上限 %s 則、每小時上限 %s 則、確認頁 %s 秒、"

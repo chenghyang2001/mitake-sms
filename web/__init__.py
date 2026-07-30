@@ -26,4 +26,4 @@
 __version__ = "0.001"
 __release_date__ = "2026-07-30"
 
-__all__ = ["audit", "server", "templates", "__version__", "__release_date__"]
+__all__ = ["audit", "recipients", "server", "templates", "__version__", "__release_date__"]
