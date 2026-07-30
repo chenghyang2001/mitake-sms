@@ -80,12 +80,13 @@ _STYLE = """
 * { box-sizing: border-box; }
 body { margin: 0; padding: 0; background: #f5f6f8; color: #1c1f23;
   font-family: "Noto Sans TC", "Microsoft JhengHei", system-ui, sans-serif; line-height: 1.6; }
-/* 兩欄外框：側欄固定寬、主內容吃剩餘空間。整組置中，避免超寬螢幕上被拉到兩端。 */
+/* 兩欄外框：側欄固定寬、主內容吃剩餘空間。仿參考站靠左對齊、不置中、不封頂，
+   讓寬螢幕上主內容能吃滿剩餘寬度（原本 max-width:60rem + margin:0 auto 會把整組
+   擠在螢幕正中央、main 又封頂在 40rem，寬螢幕上兩側留白過多）。 */
 .layout { display: flex; align-items: flex-start; gap: 1.5rem;
-  max-width: 60rem; margin: 0 auto; padding: 1.5rem 1rem; }
-/* min-width:0 讓 flex 主內容能正常收縮（否則長字串/表格會把版面撐破）。
-   main 從原本的 margin:0 auto 置中改成 flex 子項，白底卡片視覺原樣保留。 */
-main { flex: 1 1 auto; min-width: 0; max-width: 40rem; margin: 0; background: #fff;
+  padding: 1.5rem 1rem; }
+/* min-width:0 讓 flex 主內容能正常收縮（否則長字串/表格會把版面撐破）。 */
+main { flex: 1 1 auto; min-width: 0; margin: 0; background: #fff;
   border-radius: .75rem; padding: 1.25rem 1.5rem 1.75rem; box-shadow: 0 1px 4px rgba(0,0,0,.12); }
 .sidebar { flex: 0 0 15rem; background: #eef0f3; border-right: 1px solid #dde1e6;
   border-radius: .75rem; padding: 1.1rem 1rem; }
