@@ -42,6 +42,11 @@ EnvironmentFile=/etc/mitake-sms.env
 Environment=MITAKE_WEB_AUDIT_PATH=/var/log/mitake-sms/send-audit.jsonl
 Environment=PYTHONUTF8=1
 Environment=PYTHONUNBUFFERED=1
+
+# 發送對象下拉的名單檔（由內網 producer tools/build_recipients.py 產出後 scp 到這裡）。
+# 檔案不存在或空 → web 自動降級成手動輸入（見 web.recipients.load_recipients），不會壞。
+# 放 /home/claude 底下：producer 用 scp 寫得進、服務在 ProtectHome=read-only 下仍讀得到。
+Environment=MITAKE_WEB_RECIPIENTS_PATH=/home/claude/mitake-sms-data/recipients.json
 LogsDirectory=mitake-sms
 LogsDirectoryMode=0750
 
