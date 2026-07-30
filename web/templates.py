@@ -50,7 +50,7 @@ __all__ = [
     "render_sent",
     "render_status_form",
     "render_status_result",
-    "render_trial_email_stub",
+    "render_trial_email",
     "status_query_url",
 ]
 
@@ -144,6 +144,14 @@ form.inline { display: inline; }
 /* 每個 radio 佔一行、整塊可點（label 包住 input），行距足夠避免手機上誤觸。 */
 .templates .tmpl { display: block; font-weight: 400; margin: .35rem 0; cursor: pointer; }
 .templates .tmpl input { margin-right: .45rem; cursor: pointer; }
+/* 體驗借出表格（/trial-email）：輕量、沿用既有灰底/邊框色系，不引入外部資源。
+   外層 .table-wrap 用 overflow-x:auto，窄螢幕時表格自己橫向捲，不把整個版面撐破
+   （main 已設 min-width:0，配合這層才收得住寬表格）。 */
+.table-wrap { overflow-x: auto; margin: 1rem 0; }
+table.trials { width: 100%; border-collapse: collapse; font-size: .88rem; }
+table.trials th, table.trials td { text-align: left; padding: .5rem .6rem;
+  border-bottom: 1px solid #dde1e6; }
+table.trials thead th { font-weight: 700; background: #eef0f3; }
 """
 
 # 訊息範本的**單一真相來源**。radio 快選與（未來若需要的）測試都從這裡取值，
@@ -240,7 +248,7 @@ def _page(
 
     ``active_nav`` 決定左側側欄哪個入口高亮。預設 ``"sms"`` 是刻意的：既有所有
     呼叫端（發送流程的每一頁）都屬於 SMS 流程，不必逐一改就自動歸類並高亮第一個
-    入口；只有 :func:`render_trial_email_stub` 需要顯式傳 ``"trial"``。
+    入口；只有 :func:`render_trial_email` 需要顯式傳 ``"trial"``。
 
     ``noindex`` 是防呆：這個服務未來會掛上 Cloudflare Tunnel，萬一 Access 設定
     出包而被公開，至少不要被搜尋引擎收錄成「免費簡訊發送器」。
@@ -923,22 +931,70 @@ def render_status_result(
 
 
 # --------------------------------------------------------------------------- #
-# 14 天用戶體驗－郵件數據寄送（目前僅占位，尚未實作寄信本體）
+# 體驗借出管理（鏡像 AIHCR 體驗借出頁，唯讀表格；不寄信、不花錢）
 # --------------------------------------------------------------------------- #
 
 
-def render_trial_email_stub() -> str:
-    """「14 天用戶體驗－郵件數據寄送」占位頁（``GET /trial-email``）。
+def render_trial_email(book: "RecipientBook") -> str:
+    """「體驗借出管理」頁（``GET /trial-email``）。
 
-    做成占位頁而不是留 404，是為了讓側欄第二個入口點得進來：使用者看得到這個功能
-    存在、只是還沒好，而不是點了掉進死連結。這頁純唯讀、無任何表單、不寄任何郵件、
-    不花錢 —— 寄信本體是之後的工作，這裡刻意不碰。
+    鏡像 AIHCR 的體驗借出管理頁：把 producer 產出、consumer 解析後的體驗借出名單
+    渲染成一張唯讀表格（設備／客戶／接機日／天數／已用天／業務／狀態）。**純唯讀**——
+    這頁不寄任何郵件、不送出任何表單、不花任何一點。資料同樣讀 producer 產的
+    recipients.json（本服務在 VPS、到不了內網，只能靠這份快照），欄位缺漏一律顯示
+    空白、不 crash；名單空時顯示提示而非空表。
+
+    刻意**不顯示電話欄**：鏡像 AIHCR 之外，也避免在這個唯讀頁把號碼攤在畫面上被
+    肩窺／截圖（真正要用到號碼的是發送流程，那裡以 id 在伺服器端反查，見 web.server）。
+
+    ``book`` 沿用 duck typing：只呼叫 ``is_empty()`` / ``all()`` / ``generated_at``，
+    不需要真的持有 RecipientBook 類別（本檔執行期刻意不 import web.recipients）。
     """
-    body = _box(
-        "warn",
-        "🚧 功能建置中",
-        "<p>「14 天用戶體驗－郵件數據寄送」尚未實作。</p>\n"
-        "<p>這個功能將用於寄送 14 天體驗用戶的郵件數據；目前僅為占位頁面，"
-        "不會寄出任何郵件，也不會產生任何費用。</p>\n",
+    parts = ["<h1>🎁 體驗借出管理</h1>\n"]
+    parts.append(
+        '<p class="muted">管理設備體驗借出記錄，供業務登記接機／歸還，'
+        "連動 addwii CEO Agent T+3 檢查流程。</p>\n"
     )
-    return _page("14天用戶體驗-郵件數據寄送", body, active_nav="trial")
+
+    if book.is_empty():
+        # 名單空（含 producer 尚未跑、或真的沒人在體驗）→ 顯示提示，不渲染空表。
+        parts.append(
+            _box(
+                "warn",
+                "尚無資料",
+                "<p>目前沒有體驗中的借出記錄，或名單尚未同步。</p>\n",
+            )
+        )
+        return _page("體驗借出管理", "".join(parts), active_nav="trial")
+
+    # 每一格都過 _e 跳脫：book 內容源自另一支 producer（外部來源），一律當不可信輸入 ——
+    # 這是本檔「任何進入 HTML 的輸入都先跳脫」那條規則，不為「來自名單」開特例。
+    rows = []
+    for rec in book.all():
+        rows.append(
+            "<tr>"
+            f"<td>{_e(rec.device)}</td>"
+            f"<td>{_e(rec.name)}</td>"
+            f"<td>{_e(rec.borrow_date)}</td>"
+            f"<td>{_e(rec.days)}</td>"
+            f"<td>{_e(rec.used_days)}</td>"
+            f"<td>{_e(rec.business)}</td>"
+            f"<td>{_e(rec.trial_status)}</td>"
+            "</tr>\n"
+        )
+    parts.append(
+        '<div class="table-wrap">\n'
+        '<table class="trials">\n'
+        "<thead><tr>"
+        "<th>設備</th><th>客戶</th><th>接機日</th><th>天數</th>"
+        "<th>已用天</th><th>業務</th><th>狀態</th>"
+        "</tr></thead>\n"
+        f"<tbody>\n{''.join(rows)}</tbody>\n"
+        "</table>\n"
+        "</div>\n"
+    )
+    # generated_at 為 None 時省略：沒有可信的同步時間就不寫，免得誤導「這份很新」。
+    if book.generated_at:
+        parts.append(f'<p class="muted">資料同步於 {_e(book.generated_at)}</p>\n')
+
+    return _page("體驗借出管理", "".join(parts), active_nav="trial")

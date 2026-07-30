@@ -56,6 +56,9 @@ SIDEBAR_ITEM_TEXT = "🎁 體驗借出管理"
 _COL_DEVICE = 0
 _COL_CUSTOMER = 1
 _COL_BORROW_DATE = 2
+_COL_DAYS = 3
+_COL_USED = 4
+_COL_BUSINESS = 5
 _COL_STATUS = 6
 ROW_FIELD_COUNT = 7  # 每列欄位數：innerText 中一個列標記之後緊跟的 7 個非空行
 
@@ -79,7 +82,9 @@ def match_recipients(trials, active_users, *, id_prefix="u"):
     參數
     ----
     trials : list[dict]
-        每筆為 ``{"customer", "device", "borrow_date"}``（呼叫端已篩成「體驗中」）。
+        每筆為 ``{"customer", "device", "borrow_date", "days", "used_days",
+        "business", "status"}``（呼叫端已篩成「體驗中」）。後四欄只供 /trial-email
+        表格顯示，缺漏時原樣帶空字串，不影響比對邏輯。
     active_users : list[dict]
         每筆為 ``{"id", "first_name", "last_name", "phone_number"}``。
         **呼叫端只該傳 status='active' 的使用者**（已 merged/deleted 的不該進來比對）。
@@ -136,6 +141,12 @@ def match_recipients(trials, active_users, *, id_prefix="u"):
                 "device": trial.get("device"),
                 "borrow_date": trial.get("borrow_date"),
                 "match_status": match_status,
+                # 以下四欄純顯示用（/trial-email 表格），原樣帶出；缺則空字串。
+                # 與比對邏輯（id/phone/match_status）完全無關，不影響發送對象下拉。
+                "days": trial.get("days", ""),
+                "used_days": trial.get("used_days", ""),
+                "business": trial.get("business", ""),
+                "status": trial.get("status", ""),
             }
         )
     return recipients
@@ -249,12 +260,20 @@ def _parse_trials_from_body(body_text, aihcr_url):
         fields = lines[index + 1 : index + 1 + ROW_FIELD_COUNT]
         if len(fields) < ROW_FIELD_COUNT:
             break
+        # 走到這裡 fields 一定滿 7 格（上方 len(fields) < ROW_FIELD_COUNT 已 break），
+        # 所以 _COL_DAYS(3)/_COL_USED(4)/_COL_BUSINESS(5)/_COL_STATUS(6) 索引都安全，
+        # 不會 IndexError。天數/已用天/業務/狀態原樣帶下去（狀態保留 emoji 原字串，
+        # 例「🟢 體驗中」），供 /trial-email 表格顯示用。
         if TRIAL_ACTIVE_KEYWORD in fields[_COL_STATUS]:
             trials.append(
                 {
                     "customer": fields[_COL_CUSTOMER],
                     "device": fields[_COL_DEVICE],
                     "borrow_date": fields[_COL_BORROW_DATE],
+                    "days": fields[_COL_DAYS],
+                    "used_days": fields[_COL_USED],
+                    "business": fields[_COL_BUSINESS],
+                    "status": fields[_COL_STATUS],
                 }
             )
         # 跳過整列（marker + 7 欄），避免把欄位值誤當下一個 marker 掃描。

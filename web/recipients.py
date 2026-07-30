@@ -53,6 +53,14 @@ class Recipient:
     device: str
     borrow_date: str
     match_status: str
+    # 以下四欄只給 /trial-email 的體驗借出表格顯示，不參與 is_selectable / get() 反查。
+    # 帶預設值放在既有欄位之後，是 frozen dataclass 新增欄位的相容做法 —— 既有以位置或
+    # 關鍵字建構 Recipient 的地方（測試、_parse_recipient）不必全部補這四個。
+    # 用 trial_status 而非 status，避免與 match_status 混淆；它對應 JSON 的 "status" 鍵。
+    days: str = ""
+    used_days: str = ""
+    business: str = ""
+    trial_status: str = ""
 
     @property
     def is_selectable(self) -> bool:
@@ -139,6 +147,18 @@ def _parse_recipient(entry: dict[str, object]) -> Recipient | None:
     borrow_date = entry.get("borrow_date")
     borrow_date = borrow_date if isinstance(borrow_date, str) else ""
 
+    # 以下四欄純供 /trial-email 表格顯示，沿用「型別不對就當空字串」的降級風格，
+    # 缺漏一律預設 ""（不影響 is_selectable / get() 反查，發送對象下拉完全不受影響）。
+    # JSON 的 "status" 鍵對到 dataclass 的 trial_status（避免與 match_status 混淆）。
+    days = entry.get("days")
+    days = days if isinstance(days, str) else ""
+    used_days = entry.get("used_days")
+    used_days = used_days if isinstance(used_days, str) else ""
+    business = entry.get("business")
+    business = business if isinstance(business, str) else ""
+    trial_status = entry.get("status")
+    trial_status = trial_status if isinstance(trial_status, str) else ""
+
     return Recipient(
         id=recipient_id,
         name=name,
@@ -146,6 +166,10 @@ def _parse_recipient(entry: dict[str, object]) -> Recipient | None:
         device=device,
         borrow_date=borrow_date,
         match_status=match_status,
+        days=days,
+        used_days=used_days,
+        business=business,
+        trial_status=trial_status,
     )
 
 

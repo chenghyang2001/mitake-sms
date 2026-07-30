@@ -2096,17 +2096,18 @@ def test_sidebar_shows_version_and_release_date(tmp_path: Path) -> None:
     assert __release_date__ in body
 
 
-def test_trial_email_stub_is_protected_and_get_only(tmp_path: Path) -> None:
-    """`/trial-email` 占位頁：GET 回「建置中」、受 Access 保護、非 GET 回 405。
+def test_trial_email_page_is_protected_and_get_only(tmp_path: Path) -> None:
+    """`/trial-email` 體驗借出頁：GET 回 200、受 Access 保護、非 GET 回 405。
 
     受 Access 保護這點沿用「設了 require_access_email 之後除 /health 外一律要擋」
-    那套做法：不帶身分標頭連占位頁都要被擋（403）—— 整個介面只要開了 Access，
-    就不該有任何頁面漏在保護外。
+    那套做法：不帶身分標頭連這頁都要被擋（403）—— 整個介面只要開了 Access，
+    就不該有任何頁面漏在保護外。內容（表格／空名單提示）由另外的測試各自鎖，
+    這裡只鎖路由與保護，故只驗頁面標題出現、不驗表格細節。
     """
     open_app = make_app(tmp_path, RecordingSender())
-    stub = open_app.route("GET", "/trial-email")
-    assert stub.status == HTTPStatus.OK
-    assert "建置中" in stub.text
+    page = open_app.route("GET", "/trial-email")
+    assert page.status == HTTPStatus.OK
+    assert "體驗借出管理" in page.text
 
     guarded = make_app(
         tmp_path, RecordingSender(), require_access_email="peter@example.com"
@@ -2249,6 +2250,111 @@ def test_dropdown_rejects_untrusted_id_and_empty_book_falls_back_to_manual(
     assert "名單尚未同步" in form_text
     assert '<select name="recipient_id"' not in form_text
     assert send_once(manual_app).status == HTTPStatus.OK
+
+
+# --------------------------------------------------------------------------- #
+# 20. /trial-email 體驗借出表格（鏡像 AIHCR；唯讀、不寄信、不花錢）
+# --------------------------------------------------------------------------- #
+
+
+def test_trial_email_renders_table_of_trials(tmp_path: Path) -> None:
+    """注入名單後，`/trial-email` 出一張表格：七個表頭 + 每筆 recipient 一列。
+
+    鏡像 AIHCR 體驗借出管理頁（設備／客戶／接機日／天數／已用天／業務／狀態）。
+    驗某筆的 device/name/business/trial_status 值都出現，且**不含**電話號碼
+    （此頁刻意不顯示電話欄，避免號碼被肩窺／截圖）。
+    """
+    book = RecipientBook(
+        [
+            Recipient(
+                id="u46",
+                name="陳筱琪",
+                phone="0918123424",
+                device="體驗活動14天-陳筱琪4c74",
+                borrow_date="2026-07-29",
+                match_status="ok",
+                days="14",
+                used_days="3",
+                business="王小明",
+                trial_status="🟢 體驗中",
+            ),
+            Recipient(
+                id="u43",
+                name="青蘋果",
+                phone=None,
+                device="體驗活動14天-青蘋果",
+                borrow_date="2026-07-20",
+                match_status="ambiguous",
+                days="14",
+                used_days="9",
+                business="李大同",
+                trial_status="🟢 體驗中",
+            ),
+        ],
+        generated_at="2026-07-30T11:00:00+08:00",
+    )
+    app = make_app(tmp_path, RecordingSender(), recipient_source=lambda: book)
+
+    text = app.route("GET", "/trial-email").text
+
+    # 表格本體與七個表頭都在。
+    assert "<table" in text
+    for header in ("設備", "客戶", "接機日", "天數", "已用天", "業務", "狀態"):
+        assert header in text, header
+    # 某筆的 device/name/business/trial_status 值都出現（證明新四欄真的渲染出來）。
+    assert "體驗活動14天-陳筱琪4c74" in text
+    assert "陳筱琪" in text
+    assert "王小明" in text
+    assert "李大同" in text
+    assert "🟢 體驗中" in text
+    # 同步時間提示。
+    assert "資料同步於" in text
+    # 唯讀頁不顯示電話欄：真實號碼不得出現在表格裡。
+    assert "0918123424" not in text
+
+
+def test_trial_email_empty_book_shows_notice_not_table(tmp_path: Path) -> None:
+    """空名單（producer 尚未跑、或真的沒人體驗）→ 顯示提示，**不**渲染空表格。
+
+    預設 make_app 不注入 recipient_source＝空名單，正好覆蓋這條降級路徑。
+    """
+    app = make_app(tmp_path, RecordingSender())
+
+    response = app.route("GET", "/trial-email")
+
+    assert response.status == HTTPStatus.OK
+    assert "<table" not in response.text
+    assert "尚無資料" in response.text or "名單尚未同步" in response.text
+
+
+def test_trial_email_escapes_cell_values(tmp_path: Path) -> None:
+    """表格每一格都要過 _e —— 名單源自外部 producer，惡意值不得原樣進 HTML。
+
+    塞一筆 business='<script>x</script>'：輸出不得含活的 `<script>`，而應是跳脫後的
+    實體。這是回歸鎖（現況安全，存在意義是「拿掉那個 _e 之後這條會轉紅」）。
+    """
+    book = RecipientBook(
+        [
+            Recipient(
+                id="u1",
+                name="測試",
+                phone=None,
+                device="體驗機",
+                borrow_date="2026-07-29",
+                match_status="ok",
+                days="14",
+                used_days="1",
+                business="<script>x</script>",
+                trial_status="🟢 體驗中",
+            ),
+        ],
+    )
+    app = make_app(tmp_path, RecordingSender(), recipient_source=lambda: book)
+
+    text = app.route("GET", "/trial-email").text
+
+    assert "<script>x</script>" not in text
+    assert "&lt;script&gt;x&lt;/script&gt;" in text
 
 
 # --------------------------------------------------------------------------- #
