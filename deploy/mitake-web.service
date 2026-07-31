@@ -47,6 +47,12 @@ Environment=PYTHONUNBUFFERED=1
 # 檔案不存在或空 → web 自動降級成手動輸入（見 web.recipients.load_recipients），不會壞。
 # 放 /home/claude 底下：producer 用 scp 寫得進、服務在 ProtectHome=read-only 下仍讀得到。
 Environment=MITAKE_WEB_RECIPIENTS_PATH=/home/claude/mitake-sms-data/recipients.json
+
+# 「寄送體驗報告」功能（web/trial_report.py）自己的稽核檔，跟上面的 SMS 稽核
+# （send-audit.jsonl）分開存放。**不設這個會炸**：預設路徑是 repo 目錄底下的
+# logs/，但 ProtectHome=read-only 讓整個 /home（含 WorkingDirectory 這個 repo）
+# 對這個服務唯讀，寫不進去。必須明確指到 LogsDirectory= 建出來的可寫目錄。
+Environment=MITAKE_WEB_TRIAL_AUDIT_PATH=/var/log/mitake-sms/trial-report-audit.jsonl
 LogsDirectory=mitake-sms
 LogsDirectoryMode=0750
 
@@ -69,10 +75,18 @@ LogsDirectoryMode=0750
 # policy=only-me、Allow + Emails=chenghyang2001@gmail.com、session 24h）。
 Environment=MITAKE_WEB_REQUIRE_ACCESS_EMAIL=chenghyang2001@gmail.com
 
-# 🔴 鐵律：一定要寫 /usr/bin/python3.12 的絕對路徑。
-# 走 /usr/bin/python3（symlink）在這台 VPS 上會被未知機制 SIGKILL，
-# 服務會以「莫名其妙被砍」的樣子反覆重啟，且 journalctl 看不出原因。
-ExecStart=/usr/bin/python3.12 -m web.server --host 127.0.0.1 --port 8766
+# 🔴 鐵律：一定要寫絕對路徑，不要走 /usr/bin/python3（symlink）——
+# 在這台 VPS 上會被未知機制 SIGKILL，服務會以「莫名其妙被砍」的樣子反覆重啟，
+# 且 journalctl 看不出原因。
+#
+# 2026-07-31 起改用 venv（/home/claude/mitake-sms-venv）而非系統 /usr/bin/python3.12：
+# 「寄送體驗報告」功能（web/trial_report.py）需要 pymysql/matplotlib，但 VPS 是
+# PEP 668 externally-managed 環境，不能直接對系統 Python 跑 pip install。
+# mitake.py／web/ 其餘檔案完全不受影響（venv 只是換一顆直譯器，程式碼零依賴的
+# 部分照樣零依賴）。venv 建立方式：
+#   python3.12 -m venv /home/claude/mitake-sms-venv
+#   /home/claude/mitake-sms-venv/bin/pip install -r /home/claude/mitake-sms/requirements.txt
+ExecStart=/home/claude/mitake-sms-venv/bin/python3 -m web.server --host 127.0.0.1 --port 8766
 
 Restart=always
 RestartSec=5
