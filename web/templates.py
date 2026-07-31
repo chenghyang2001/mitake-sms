@@ -957,10 +957,12 @@ def render_trial_email(book: "RecipientBook") -> str:
 
     鏡像 AIHCR 的體驗借出管理頁：把 producer 產出、consumer 解析後的體驗借出名單
     渲染成一張唯讀表格（設備／客戶／接機日／天數／已用天／業務／狀態／寄送體驗報告）。
-    最後一欄「寄送體驗報告」是一顆按鈕，依該列已用天數是否達到天數決定可否點擊
-    （見 :func:`_parse_trial_day_count`），但**目前沒有接任何 onclick／表單提交／
-    後端動作，純粹是外觀 placeholder**，實際寄送行為之後才會補上。除了這顆按鈕，
-    整頁**仍是純唯讀**——這頁不寄任何郵件、不送出任何表單、不花任何一點。資料同樣讀
+    最後一欄「寄送體驗報告」是一顆會真的 POST 到 ``/trial-email/send-report`` 的
+    ``<form>``（帶隱藏欄位 ``recipient_id``），依該列已用天數是否達到天數決定按鈕
+    可否點擊（見 :func:`_parse_trial_day_count`）——**但這只是前端的省事提示**，
+    伺服器端（:func:`web.trial_report.send_trial_report`）一定會重新驗證一次，
+    devtools 移除 disabled 屬性也不會真的寄出報告。除了這顆按鈕會觸發寄信之外，
+    整頁其餘部分**仍是純唯讀**：不會因為打開這頁本身就寄出任何郵件。資料同樣讀
     producer 產的 recipients.json（本服務在 VPS、到不了內網，只能靠這份快照），
     欄位缺漏一律顯示空白、不 crash；名單空時顯示提示而非空表。
 
@@ -1006,8 +1008,13 @@ def render_trial_email(book: "RecipientBook") -> str:
             f"<td>{_e(rec.used_days)}</td>"
             f"<td>{_e(rec.business)}</td>"
             f"<td>{_e(rec.trial_status)}</td>"
-            f'<td><button type="button" class="send-report-btn"{disabled_attr}>'
-            "寄送體驗報告</button></td>"
+            "<td>"
+            '<form method="post" action="/trial-email/send-report" class="inline">'
+            f'<input type="hidden" name="recipient_id" value="{_e(rec.id)}">'
+            f'<button type="submit" class="send-report-btn"{disabled_attr}>'
+            "寄送體驗報告</button>"
+            "</form>"
+            "</td>"
             "</tr>\n"
         )
     parts.append(

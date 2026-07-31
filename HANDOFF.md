@@ -299,6 +299,20 @@ A/B：新 kind `bad_response` 唯一能到 job_010 的入口是 64 KiB 上限，
    模組固定走 `https://smsapi.mitake.com.tw`，中間人看得到 query string 已等於 TLS 被攔截，
    那是更大的問題。若做第 1 項，順手在 `_preview_for_error` 裡遮蔽帳密字串即可一併蓋掉。
 
+### 6.6 「寄送體驗報告」功能（`web/trial_report.py`，2026-07-31，程式碼已合併、**VPS 尚未部署**）
+
+`/trial-email` 頁的「寄送體驗報告」按鈕（已用天數 ≥ 天數才可點）呼叫
+`POST /trial-email/send-report`，查 `acfh_api` MySQL 撈 14 天 telemetry、算統計、產 PDF、寄
+email 給客戶（Bcc 固定內部信箱）。完整規格見 `doc/spec-trial-report.md`。
+
+**這裡只記錄部署會用到、`HANDOFF.md` §4「VPS 環境鐵律」的人需要知道的事**：
+
+- 新增 4 個環境變數，要進 `/etc/mitake-sms.env`（mode 600）：`MYSQL_RD2_PASSWORD`（`acfh_api` 唯讀帳號 `rd2` 的密碼）、`GMAIL_USER`／`GMAIL_APP_PASSWORD`（沿用 `aihcr-daily` 現有 Gmail 帳號，**兩個 repo 各自存一份**，不共用同一個 env 檔——見下一條）、`MITAKE_WEB_STAFF_BCC`（逗號分隔的固定 Bcc 清單，沒設就只寄客戶本人，不是致命錯誤）。
+- ⚠️ **這台 VPS 上已經有另一個 repo（`aihcr-daily`）也在用同一組 `MYSQL_RD2_PASSWORD`／`GMAIL_USER`／`GMAIL_APP_PASSWORD`**（存在 `~/.env_vars`，被 `~/acfh-report/run-acfh-14d-report-vps.sh` cron 用）。`mitake-web` 讀的是**自己的** `/etc/mitake-sms.env`，兩邊刻意不共用同一個檔案（保持兩個 repo 互不依賴），但代表**密碼輪替時要記得兩邊都要改**，只改一邊會讓另一邊悄悄用舊密碼失敗。
+- 🔴 **和 §4 的「allowlist 只載 2 個 key」是兩件不同的事，不要搞混**：§4 講的是 `n8n2vps-hub` 這個 24/7 常駐 process 讀 `/etc/mitake-sms.env` 時只挑 `MITAKE_USERNAME`/`MITAKE_PASSWORD` 兩個 key（避免全量污染那個 process）。`mitake-web.service` 是完全獨立的 systemd 服務，用 `EnvironmentFile=` 整份載入自己的 env 檔，不受那個 allowlist 限制——新增這 4 個 key 到 `/etc/mitake-sms.env` **不需要**也**不會**去改 `n8n2vps-hub` 那份 allowlist。
+- **部署前置作業**（尚未執行，見 todo #6）：`pymysql`/`matplotlib` 是這次唯一破例引入的第三方依賴（ADR #13，見 `doc/architecture.md`），VPS 是 PEP 668 externally-managed 環境，`mitake-web.service` 的 `ExecStart` 要從系統 Python 改成 venv 內的 python（比照 `~/acfh-report/.venv` 的既有做法），否則 `pip install` 會直接失敗。
+- **已知限制**（MVP 刻意不做）：客戶同時借多台裝置時擋下不寄（不猜是哪一台）；不防同一筆紀錄短時間被重複點擊（稽核記錄只做事後追蹤，不擋按鈕）；`smtp.sendmail()` 的部分拒收回傳值有檢查（客戶本人被拒收會回報失敗，不會誤報成功），但 Bcc 被拒收只記 log、不影響客戶端結果，見 `web/trial_report.py` 的 `_send_real_gmail` docstring。
+
 ---
 
 <details>

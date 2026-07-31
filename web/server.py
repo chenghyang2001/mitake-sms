@@ -82,6 +82,7 @@ import mitake  # noqa: E402  （必須等 sys.path 補完才 import）
 
 from web import recipients  # noqa: E402
 from web import templates  # noqa: E402
+from web import trial_report  # noqa: E402
 from web.audit import DEFAULT_TAIL_LINES, AuditLog, mask_phone  # noqa: E402
 
 __all__ = [
@@ -91,6 +92,10 @@ __all__ = [
     "DEFAULT_RATE_LIMIT_SEGMENTS",
     "DEFAULT_STATUS_QUERY_LIMIT",
     "DEFAULT_TOKEN_TTL_SECONDS",
+    "ENV_GMAIL_APP_PASSWORD",
+    "ENV_GMAIL_USER",
+    "ENV_MYSQL_RD2_PASSWORD",
+    "ENV_STAFF_BCC",
     "STATUS_QUERY_WINDOW_SECONDS",
     "PendingSend",
     "RateLimitExceededError",
@@ -166,6 +171,19 @@ ENV_RECIPIENTS_PATH = "MITAKE_WEB_RECIPIENTS_PATH"
 # Cf-Access-Jwt-Assertion 的簽章，但驗它要拉 JWKS＝破壞零外部依賴），
 # 用途說明見 SmsWebApp._deny_without_access_email。
 ACCESS_EMAIL_HEADER = "Cf-Access-Authenticated-User-Email"
+
+# /trial-email 「寄送體驗報告」用到的三個環境變數常數，字串值的**唯一真相來源**
+# 在 web.trial_report（它才是真正讀取這三個值去連 DB／登入 Gmail 的地方）。
+# 這裡直接重新匯出而非另外寫死同一組字串，避免兩處常數字面值日後漂移。
+ENV_MYSQL_RD2_PASSWORD = trial_report.ENV_MYSQL_RD2_PASSWORD
+ENV_GMAIL_USER = trial_report.ENV_GMAIL_USER
+ENV_GMAIL_APP_PASSWORD = trial_report.ENV_GMAIL_APP_PASSWORD
+
+# 密件副本的固定內部信箱清單（逗號分隔）。刻意**不**進 git（公開 repo）：本機
+# .env 與 VPS /etc/mitake-sms.env（各自 mode 600）各設一份，.env.example 只放
+# 示意值。讀不到就是空 tuple——沒設定不是致命錯誤，只是這次寄送不 Bcc 任何人，
+# 沒理由讓少了這個選填設定就讓整個服務起不來。
+ENV_STAFF_BCC = "MITAKE_WEB_STAFF_BCC"
 
 # CSP nonce 的位元組數。16 bytes = 128 bit，遠超過「猜中一個一次性隨機值」所需。
 CSP_NONCE_BYTES = 16
@@ -755,6 +773,8 @@ class SmsWebApp:
         request_id_factory: Callable[[], str] | None = None,
         require_access_email: str | None = None,
         recipient_source: Callable[[], recipients.RecipientBook] | None = None,
+        trial_report_sender: Callable[..., trial_report.TrialReportResult] | None = None,
+        staff_bcc: Sequence[str] | None = None,
     ) -> None:
         if max_segments < 1:
             raise ValueError(f"單次則數上限必須 >= 1，收到 {max_segments}")
@@ -800,6 +820,21 @@ class SmsWebApp:
             else:
                 self._recipient_source = lambda: recipients.RecipientBook.empty()
 
+        # 「寄送體驗報告」的實際邏輯。可注入（測試餵假的 sender，完全不碰真實
+        # DB／不真的寄信）；沒注入時指向真正會連 acfh_api、真的寄 Gmail 的實作。
+        self._trial_report_sender = (
+            trial_report_sender if trial_report_sender is not None else trial_report.send_trial_report
+        )
+
+        # 密件副本固定名單。可注入（測試方便）；沒注入時讀 ENV_STAFF_BCC，
+        # split + strip + 過濾空字串。讀不到／設成空字串都收斂成空 tuple——
+        # 見 ENV_STAFF_BCC 常數旁的說明，這不是致命錯誤。
+        if staff_bcc is not None:
+            self._staff_bcc: tuple[str, ...] = tuple(staff_bcc)
+        else:
+            raw_bcc = os.environ.get(ENV_STAFF_BCC, "")
+            self._staff_bcc = tuple(addr.strip() for addr in raw_bcc.split(",") if addr.strip())
+
     # -- 唯讀屬性（給啟動訊息與測試用） ------------------------------------- #
 
     @property
@@ -827,6 +862,11 @@ class SmsWebApp:
     def status_throttle(self) -> StatusQueryThrottle:
         """投遞狀態查詢的節流器。與 :attr:`rate_limiter`（發送則數）互不相干。"""
         return self._status_throttle
+
+    @property
+    def staff_bcc(self) -> tuple[str, ...]:
+        """體驗報告固定密件副本清單（見 ENV_STAFF_BCC）。主要供測試與啟動訊息使用。"""
+        return self._staff_bcc
 
     def _recipients(self) -> recipients.RecipientBook:
         """取得**當下**的發送對象名單。
@@ -888,6 +928,15 @@ class SmsWebApp:
             # （這正是要的：整個介面只要設了 Access 就不該有任何頁面漏在外面）。
             return (
                 self.handle_trial_email() if method == "GET" else self._method_not_allowed()
+            )
+        if path == "/trial-email/send-report":
+            # 同樣受 Access 保護（排在 _deny_without_access_email 之後）。
+            # 只收 POST：這是本頁唯一會觸發外部副作用（寄 Email）的動作，
+            # 同 /send 的理由，不該是一個 GET 就能觸發的連結。
+            return (
+                self.handle_send_trial_report(form)
+                if method == "POST"
+                else self._method_not_allowed()
             )
         return self._not_found()
 
@@ -991,6 +1040,99 @@ class SmsWebApp:
         """
         return _html_response(
             HTTPStatus.OK, templates.render_trial_email(self._recipients())
+        )
+
+    # 失敗原因中，屬於「資料面／操作面」問題的一律回 400——重選對象、等體驗到期、
+    # 或去補齊 acfh_api 的裝置／email 資料就能解決，操作者自己能處理。其餘（DB
+    # 連不上、寄信失敗）回 500——那是上游問題，不是這次表單填錯了什麼。
+    _TRIAL_REPORT_CLIENT_REASONS = frozenset(
+        {
+            trial_report.REASON_DAYS_NOT_REACHED,
+            trial_report.REASON_INVALID_RECIPIENT_ID,
+            trial_report.REASON_NO_DEVICE,
+            trial_report.REASON_MULTIPLE_DEVICES,
+            trial_report.REASON_NO_EMAIL,
+            trial_report.REASON_NO_TELEMETRY,
+        }
+    )
+
+    def handle_send_trial_report(self, form: Mapping[str, Sequence[str]]) -> Response:
+        """寄送體驗報告（``POST /trial-email/send-report``）。
+
+        這是 ``/trial-email`` 頁唯一會觸發外部副作用（寄 Email）的動作。沿用
+        ``/preview`` 下拉模式同一套「不信任前端資料」原則：表單只讀
+        ``recipient_id``，客戶的其餘資訊（email、天數、業務）一律由
+        :meth:`_recipients` 反查取得，不信任前端可能夾帶的任何欄位——即使
+        這裡沒有電話號碼、不花三竹點數，寄錯資料給客戶的代價同樣不小。
+
+        真正的資格重新驗證（已用天數 >= 天數、裝置數必須剛好 1、email 非空、
+        14 天內有資料）全部發生在 :func:`web.trial_report.send_trial_report`
+        內部，本函式只負責反查 recipient、呼叫、把結果轉譯成 HTTP 回應。
+        """
+        recipient_id = _first(form, "recipient_id")
+        if not recipient_id:
+            return _html_response(
+                HTTPStatus.BAD_REQUEST,
+                templates.render_notice(
+                    title="無法寄送體驗報告",
+                    heading="缺少發送對象",
+                    message="表單未帶發送對象編號，未執行任何動作，也沒有寄送任何郵件。",
+                    kind="error",
+                ),
+            )
+
+        rec = self._recipients().get(recipient_id)
+        if rec is None:
+            # 未知 id、或名單已更新導致這筆不再可選：一律擋下，不猜、不繼續。
+            return _html_response(
+                HTTPStatus.BAD_REQUEST,
+                templates.render_notice(
+                    title="無法寄送體驗報告",
+                    heading="查無此發送對象",
+                    message="所選對象無法解析，可能名單已更新，請重新整理頁面後再試。"
+                    "未執行任何動作，也沒有寄送任何郵件。",
+                    kind="error",
+                ),
+            )
+
+        try:
+            result = self._trial_report_sender(rec, staff_bcc=self._staff_bcc)
+        except Exception:  # noqa: BLE001 -- 未預期的例外不外洩內部細節，沿用本專案既有慣例
+            logger.exception("寄送體驗報告時發生未預期錯誤：recipient_id=%s", recipient_id)
+            return _html_response(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                templates.render_notice(
+                    title="無法寄送體驗報告",
+                    heading="系統發生未預期錯誤",
+                    message="寄送體驗報告時發生未預期錯誤，是否已經寄出無法確認，請查看伺服器日誌。",
+                    kind="error",
+                ),
+            )
+
+        if result.success:
+            return _html_response(
+                HTTPStatus.OK,
+                templates.render_notice(
+                    title="體驗報告已寄送",
+                    heading="已寄送",
+                    message=result.message,
+                    kind="ok",
+                ),
+            )
+
+        status = (
+            HTTPStatus.BAD_REQUEST
+            if result.reason in self._TRIAL_REPORT_CLIENT_REASONS
+            else HTTPStatus.INTERNAL_SERVER_ERROR
+        )
+        return _html_response(
+            status,
+            templates.render_notice(
+                title="無法寄送體驗報告",
+                heading="未寄送",
+                message=result.message,
+                kind="error",
+            ),
         )
 
     def handle_preview(self, form: Mapping[str, Sequence[str]]) -> Response:

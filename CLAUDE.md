@@ -103,13 +103,14 @@ user lives here once, so fixing it once fixes it everywhere.
 - Deliberately **does not check `query_balance()` before `send_sms()`** — that would introduce a
   TOCTOU race against the App team draining the same pool between the check and the send.
 
-### `web/` — the send/status HTTP interface (stdlib `http.server`, zero third-party deps)
+### `web/` — the send/status HTTP interface (stdlib `http.server`, zero third-party deps — except `trial_report.py`, see below)
 
 - `server.py` — routes, two-phase send (`POST /preview` → one-time token → `POST /send`), a sliding
   per-hour segment-based rate limiter, a separate free-query throttle for `/status`, and an
   application-layer header check (`Cf-Access-Authenticated-User-Email`) that is **not real auth**
   (the header is forgeable) — its job is to turn "Cloudflare Access misconfigured" from a silent
-  open gateway into a visible 403.
+  open gateway into a visible 403. Also routes `POST /trial-email/send-report` to
+  `trial_report.send_trial_report`.
 - `templates.py` — HTML generation; all user input goes through `html.escape`. Deliberately does
   **not** import `mitake` (see `web/__init__.py` docstring — import-order fragility isn't worth it
   for a handful of string constants, so a few classification strings are duplicated and locked down
@@ -117,14 +118,37 @@ user lives here once, so fixing it once fixes it everywhere.
 - `audit.py` — send audit log (`send-audit.jsonl`, phone numbers masked to last 4 digits); the rate
   limiter replays this file on startup to avoid resetting quotas on every restart.
 - `recipients.py` — loads the optional recipient dropdown from `MITAKE_WEB_RECIPIENTS_PATH`;
-  missing/empty file is a supported state (falls back to manual phone entry), never a crash.
+  missing/empty file is a supported state (falls back to manual phone entry), never a crash. Also
+  has `parse_acfh_user_id()` / `Recipient.acfh_user_id` — the acfh `users.id` a trial recipient
+  matched to (see `trial_report.py`), derived by stripping the `u` prefix `tools/build_recipients.py`
+  puts on `Recipient.id`.
+- `trial_report.py` — **the one deliberate exception to the zero-dependency rule** (`pymysql` +
+  `matplotlib`, both imported lazily inside functions, never at module top, so the rest of `web/`
+  stays importable even if these aren't installed). Reuses query/analysis/PDF/email logic
+  rewritten from the separate `aihcr-daily` repo's
+  `scripts/acfh_daily_report_14_days_experiencing.py` (`hours=24` there → `hours=336` here) to
+  send a customer a 14-day PM2.5/CO2/VOC/temperature/humidity report by email when their trial
+  reaches full term. Every DB/SMTP touchpoint is behind an injectable `conn_factory` /
+  `email_sender` (same pattern as `server.py`'s `sender`/`recipient_source`), so tests never hit
+  the real `acfh_api` database or send a real email. The server re-validates "used days ≥ total
+  days" independently server-side using the exact same `_parse_trial_day_count` the button's
+  enable/disable state uses — never trusts the frontend's `disabled` attribute. Customers with
+  anything other than exactly 1 active device are refused, not guessed at. See
+  `doc/spec-trial-report.md` for the full spec and known limitations (no multi-device support, no
+  duplicate-send protection).
 - Server binds `127.0.0.1` only by default; going public requires both `--host` and
   `--allow-public` explicitly — no accidental exposure via a changed default.
 
 ### `tools/build_recipients.py` — the producer half of a file-handoff pattern
 
-The VPS cannot reach the company's internal network (AIHCR / `acfh_api` MySQL), so this script runs
-on a machine that *can* reach both the LAN and (via `scp`) the VPS. It scrapes the AIHCR "體驗借出"
+The VPS cannot reach the AIHCR "體驗借出" **Streamlit page** (internal-LAN-only web UI), so this
+script runs on a machine that *can* reach both the LAN and (via `scp`) the VPS.
+**Correction (2026-07-31, verified with a live read-only dry run):** the `acfh_api` MySQL database
+itself is a separate matter — it's an AWS RDS instance with an IP-whitelisted public endpoint, and
+the VPS (`187.127.109.145`) **is** on that whitelist (the `aihcr-daily` repo's daily-report cron
+job connects to it directly from this same VPS, and `web/trial_report.py` in this repo does too).
+Don't conflate "can't reach the Streamlit admin page" with "can't reach the database" — only the
+former is true. It scrapes the AIHCR "體驗借出"
 Streamlit page (no real `<table>` DOM — parsed from `page.inner_text("body")` split on the row
 delimiter `○`) and cross-references the read-only `acfh_api` MySQL table, then atomically writes
 `recipients.json` (temp file + `os.replace`) which `web/recipients.py` later reads. It never imports
@@ -154,3 +178,8 @@ importable/testable without those third-party deps installed.
   major design decision plus its cost) — read before changing anything that looks over-engineered
   for a "just call an SMS API" tool; it almost certainly isn't.
 - `doc/session*-summary.md` — chronological log of what changed each session and why.
+- `doc/spec-trial-report.md` — spec for the `/trial-email` "寄送體驗報告" feature (`web/trial_report.py`):
+  boundary conditions, deliberate MVP limitations, and the new env vars it needs on the VPS
+  (`MYSQL_RD2_PASSWORD` / `GMAIL_USER` / `GMAIL_APP_PASSWORD` / `MITAKE_WEB_STAFF_BCC`). As of this
+  writing the VPS deployment step (venv + systemd unit update + env vars) is still pending — code is
+  merged and tested locally, not yet live.

@@ -47,6 +47,7 @@ HTTP 請求。所有「會花錢」與「會誤導人」的判斷都集中在同
 | **Web 進入點** | `web/server.py`（2039 行） | 路由、二階段送出、速率、存取檢查 | stdlib `http.server`，多執行緒 |
 | Web 支援 | `web/templates.py`（696 行） | HTML 產生，使用者輸入一律 `html.escape` | 刻意不 import `mitake`（避免脆弱的匯入順序） |
 | Web 支援 | `web/audit.py`（265 行） | 發送留底 | 號碼遮罩留後四碼；速率回填從此檔 tail |
+| Web 支援 | `web/trial_report.py`（1064 行） | `POST /trial-email/send-report`：查 `acfh_api` 14 天 telemetry、產統計＋PDF、Gmail 寄信 | 見 ADR #13；`conn_factory`／`email_sender` 皆可注入，測試不連真實 DB／SMTP；伺服器端獨立重算「已用天數 ≥ 天數」，不信任前端 |
 | **排程進入點** | `n8n2vps-hub/jobs/job_010_mitake_balance/`（**另一個 repo**） | 每日 08:00 查餘額、低於門檻三管道告警 | 門檻在 hub 的 `config.json`，**不是** env 檔 |
 | 測試護欄 | `tests/conftest.py`（184 行） | 預設封鎖 `_OPENER.open` | 忘記 mock 的測試直接紅燈（`RealMitakeAPICallBlocked`），不是靜默扣點 |
 | 外部 | 三竹 API `smsapi.mitake.com.tw` | SmSend 扣點 / SmQuery 免費 | 回應 Big5、IP 白名單強制、無 API Key 機制（帳密走 query string） |
@@ -177,6 +178,7 @@ APScheduler 08:00 Asia/Taipei
 | 10 | **查詢另開節流器**（30 次/5 分鐘） | 查詢免費，與發送共用計數器會讓「查狀態」吃掉「還能發幾則」的預算 | 兩套限流邏輯要各自維護。查詢仍是對三竹的真實請求，連刷會讓來源 IP 被限流而**連發簡訊一起壞** |
 | 11 | **回應讀取上限 64 KiB，超限拒絕而非截斷** | 三竹正常回應數十位元組，超過代表拿到的不是預期內容（代理器 HTML、DNS 劫持）。截斷後解出的任何狀態都是憑空捏造 | `_fetch_raw` 是 `query_balance`/`send_sms` 共用底層，改動需完整回歸（已用逐位元組比對鎖住） |
 | 12 | **`templates.py` 不 import `mitake`** | `web/__init__.py` 載明匯入順序脆弱，為幾個字串常數建立那條相依不划算 | 6 個分類字串重複一份。已用測試機械釘死，任一邊改名立刻紅燈（實測有效） |
+| 13 | **`web/trial_report.py` 破例引入 `pymysql`／`matplotlib`（其餘 `web/` 仍零依賴）** | 「14 天體驗報告」功能要查 `acfh_api` MySQL、畫 5 面板折線圖 PDF——這兩件事標準庫做不到，且 `aihcr-daily` repo 已有一支正在 VPS 上跑、驗證過的實作可改寫重用，重寫一套純 stdlib 版本（例如手刻 SVG 折線圖）不划算 | VPS 上 `mitake-web` 這個 systemd 服務要改用 venv 執行（PEP 668 externally-managed），不能再靠系統 Python 直接跑；兩個套件皆延遲 import（函式內才 import，型別註解靠 `from __future__ import annotations` 不求值），確保這兩個依賴沒裝好之前，SMS 核心功能（`mitake.py`／`web/server.py` 其餘路由）仍可正常啟動——這點已由 code review 逐一核對延遲 import 貫徹到底 |
 
 ---
 

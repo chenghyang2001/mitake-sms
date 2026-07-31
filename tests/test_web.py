@@ -70,6 +70,11 @@ from web.server import (  # noqa: E402
     create_server,
     make_handler,
 )
+from web.trial_report import (  # noqa: E402
+    REASON_DAYS_NOT_REACHED,
+    REASON_DB_ERROR,
+    TrialReportResult,
+)
 
 VALID_PHONE = "0912345678"
 SHORT_BODY = "測試內容ABC"
@@ -225,12 +230,19 @@ def make_app(
     status_query: "RecordingStatusQuery | None" = None,
     status_query_limit: int = 30,
     recipient_source: "Callable[[], RecipientBook] | None" = None,
+    trial_report_sender: "Callable[..., object] | None" = None,
+    staff_bcc: "tuple[str, ...] | None" = None,
 ) -> SmsWebApp:
     """建一個完全離線的 app：假 sender、假 status_query、假時鐘、稽核檔落在 tmp_path。
 
     ``recipient_source`` 預設 None：既有呼叫端不傳，走 SmsWebApp 的預設（空名單、
     手機號碼手動輸入模式），既有測試因此完全不受下拉選單功能影響。下拉相關的測試
     自己注入一個回傳記憶體內 RecipientBook 的 source。
+
+    ``trial_report_sender`` / ``staff_bcc`` 同理：預設 None 時 SmsWebApp 會用真正的
+    ``web.trial_report.send_trial_report`` 與讀 ``MITAKE_WEB_STAFF_BCC`` 環境變數，
+    但**本檔任何測試都不該讓它走到那條路徑**（會真的連 acfh_api／真的寄 Gmail）——
+    凡是會呼叫 ``POST /trial-email/send-report`` 的測試都必須自己傳一個假 sender。
     """
     return SmsWebApp(
         sender=sender,
@@ -248,6 +260,8 @@ def make_app(
         request_id_factory=lambda: "req-test",
         require_access_email=require_access_email,
         recipient_source=recipient_source,
+        trial_report_sender=trial_report_sender,
+        staff_bcc=staff_bcc,
     )
 
 
@@ -2388,7 +2402,7 @@ def test_trial_email_send_report_button_enabled_when_used_days_reaches_total(
     assert "寄送體驗報告" in text
     assert "<button" in text
     # 抓出這顆按鈕的完整標籤，確認裡面沒有 disabled 屬性。
-    match = re.search(r'<button type="button" class="send-report-btn"[^>]*>', text)
+    match = re.search(r'<button type="submit" class="send-report-btn"[^>]*>', text)
     assert match is not None
     assert "disabled" not in match.group()
 
@@ -2420,7 +2434,7 @@ def test_trial_email_send_report_button_disabled_when_used_days_below_total(
 
     text = app.route("GET", "/trial-email").text
 
-    match = re.search(r'<button type="button" class="send-report-btn"[^>]*>', text)
+    match = re.search(r'<button type="submit" class="send-report-btn"[^>]*>', text)
     assert match is not None
     assert "disabled" in match.group()
 
@@ -2471,7 +2485,7 @@ def test_trial_email_send_report_button_handles_real_world_day_formats(
     text = response.text
     assert "寄送體驗報告" in text
 
-    buttons = re.findall(r'<button type="button" class="send-report-btn"[^>]*>', text)
+    buttons = re.findall(r'<button type="submit" class="send-report-btn"[^>]*>', text)
     assert len(buttons) == 2
     # 第一筆「14 天」/「14 天」解析成功且已達標 → 可點。
     assert "disabled" not in buttons[0]
@@ -2536,3 +2550,280 @@ def test_template_autofill_wired_via_addeventlistener_and_single_script() -> Non
     # 全頁只有一支 <script>（就是帶 nonce 的那支），沒有新增第二支。
     assert html.count("<script") == 1
     assert '<script nonce="n">' in html
+
+
+# --------------------------------------------------------------------------- #
+# 21. POST /trial-email/send-report（寄送體驗報告；本檔只測路由層轉譯，
+#     web.trial_report.send_trial_report 內部驗證邏輯見 tests/test_trial_report.py）
+# --------------------------------------------------------------------------- #
+
+
+class RecordingTrialReportSender:
+    """假的 ``web.trial_report.send_trial_report``：記下呼叫參數，回傳設定好的結果。
+
+    本檔測的是「伺服器路由層」——反查 recipient、呼叫 sender、把結果轉譯成
+    HTTP 回應這三件事，不是體驗報告本身的驗證邏輯（那部分見
+    tests/test_trial_report.py）。用這個假身讓兩層測試完全independent，
+    互相修改不需要同步。
+    """
+
+    def __init__(self, result: TrialReportResult) -> None:
+        self.calls: list[dict] = []
+        self._result = result
+
+    def __call__(self, recipient: Recipient, *, staff_bcc: tuple = ()) -> TrialReportResult:
+        self.calls.append({"recipient": recipient, "staff_bcc": tuple(staff_bcc)})
+        return self._result
+
+
+def _trial_book_with_one_ok_recipient(recipient_id: str = "u46") -> RecipientBook:
+    """一份只含 1 筆可選對象的名單，供 /trial-email/send-report 測試共用。"""
+    return RecipientBook(
+        [
+            Recipient(
+                id=recipient_id,
+                name="陳筱琪",
+                phone="0912345678",
+                device="體驗機",
+                borrow_date="2026-07-01",
+                match_status="ok",
+                days="14",
+                used_days="14",
+                business="王小明",
+                trial_status="🟢 體驗中",
+            ),
+        ],
+    )
+
+
+def test_send_trial_report_get_is_method_not_allowed(tmp_path: Path) -> None:
+    """GET /trial-email/send-report → 405（同其餘會觸發副作用的端點慣例，只收 POST）。"""
+    app = make_app(
+        tmp_path,
+        RecordingSender(),
+        recipient_source=_trial_book_with_one_ok_recipient,
+        trial_report_sender=RecordingTrialReportSender(
+            TrialReportResult(success=True, recipient_id="u46", reason=None, message="ok")
+        ),
+    )
+
+    assert app.route("GET", "/trial-email/send-report").status == HTTPStatus.METHOD_NOT_ALLOWED
+
+
+def test_send_trial_report_requires_access_email_when_configured(tmp_path: Path) -> None:
+    """設了 require_access_email 時，這條路由要跟其他頁面一樣受保護（403，不是漏網之魚）。"""
+    fake_sender = RecordingTrialReportSender(
+        TrialReportResult(success=True, recipient_id="u46", reason=None, message="ok")
+    )
+    app = make_app(
+        tmp_path,
+        RecordingSender(),
+        recipient_source=_trial_book_with_one_ok_recipient,
+        trial_report_sender=fake_sender,
+        require_access_email="ops@example.com",
+    )
+
+    response = app.route(
+        "POST", "/trial-email/send-report", form={"recipient_id": ["u46"]}
+    )
+
+    assert response.status == HTTPStatus.FORBIDDEN
+    assert fake_sender.calls == []
+
+
+def test_send_trial_report_missing_recipient_id_blocks_without_calling_sender(
+    tmp_path: Path,
+) -> None:
+    """表單沒帶 recipient_id → 400，且完全不呼叫 sender（不執行任何動作）。"""
+    fake_sender = RecordingTrialReportSender(
+        TrialReportResult(success=True, recipient_id="u46", reason=None, message="ok")
+    )
+    app = make_app(
+        tmp_path,
+        RecordingSender(),
+        recipient_source=_trial_book_with_one_ok_recipient,
+        trial_report_sender=fake_sender,
+    )
+
+    response = app.route("POST", "/trial-email/send-report", form={})
+
+    assert response.status == HTTPStatus.BAD_REQUEST
+    assert fake_sender.calls == []
+
+
+def test_send_trial_report_unknown_recipient_id_blocks_without_calling_sender(
+    tmp_path: Path,
+) -> None:
+    """recipient_id 查無此人（或名單已更新）→ 400，不呼叫 sender。
+
+    這是防竄改的核心：不管前端傳什麼 recipient_id 過來，伺服器只信自己反查的結果。
+    """
+    fake_sender = RecordingTrialReportSender(
+        TrialReportResult(success=True, recipient_id="u46", reason=None, message="ok")
+    )
+    app = make_app(
+        tmp_path,
+        RecordingSender(),
+        recipient_source=_trial_book_with_one_ok_recipient,
+        trial_report_sender=fake_sender,
+    )
+
+    response = app.route(
+        "POST", "/trial-email/send-report", form={"recipient_id": ["u999-does-not-exist"]}
+    )
+
+    assert response.status == HTTPStatus.BAD_REQUEST
+    assert fake_sender.calls == []
+
+
+def test_send_trial_report_success_renders_ok_page_and_calls_sender_once(
+    tmp_path: Path,
+) -> None:
+    """成功路徑：200、畫面顯示 sender 回傳的訊息、sender 只被呼叫一次且帶對的 recipient。"""
+    fake_sender = RecordingTrialReportSender(
+        TrialReportResult(
+            success=True,
+            recipient_id="u46",
+            reason=None,
+            message="已寄送給 ch***@example.com。",
+            email_masked="ch***@example.com",
+            pdf_attached=True,
+        )
+    )
+    app = make_app(
+        tmp_path,
+        RecordingSender(),
+        recipient_source=_trial_book_with_one_ok_recipient,
+        trial_report_sender=fake_sender,
+        staff_bcc=("staff1@example.com", "staff2@example.com"),
+    )
+
+    response = app.route(
+        "POST", "/trial-email/send-report", form={"recipient_id": ["u46"]}
+    )
+
+    assert response.status == HTTPStatus.OK
+    assert "已寄送給 ch***@example.com" in response.text
+    assert len(fake_sender.calls) == 1
+    assert fake_sender.calls[0]["recipient"].id == "u46"
+    assert fake_sender.calls[0]["staff_bcc"] == ("staff1@example.com", "staff2@example.com")
+
+
+def test_send_trial_report_client_side_reason_renders_400(tmp_path: Path) -> None:
+    """sender 回傳「資料面」失敗原因（如已用天數不足）→ 400，不是 500。"""
+    fake_sender = RecordingTrialReportSender(
+        TrialReportResult(
+            success=False,
+            recipient_id="u46",
+            reason=REASON_DAYS_NOT_REACHED,
+            message="已用天數尚未達到體驗天數，未寄送任何郵件。",
+        )
+    )
+    app = make_app(
+        tmp_path,
+        RecordingSender(),
+        recipient_source=_trial_book_with_one_ok_recipient,
+        trial_report_sender=fake_sender,
+    )
+
+    response = app.route(
+        "POST", "/trial-email/send-report", form={"recipient_id": ["u46"]}
+    )
+
+    assert response.status == HTTPStatus.BAD_REQUEST
+    assert "已用天數尚未達到" in response.text
+
+
+def test_send_trial_report_upstream_reason_renders_500(tmp_path: Path) -> None:
+    """sender 回傳「上游」失敗原因（如 DB 連線失敗）→ 500，不是 400。
+
+    500 頁不得洩漏內部細節（同本專案既有慣例）——這裡只確認狀態碼與訊息本身，
+    訊息內容由 web.trial_report 端保證不含連線字串。
+    """
+    fake_sender = RecordingTrialReportSender(
+        TrialReportResult(
+            success=False,
+            recipient_id="u46",
+            reason=REASON_DB_ERROR,
+            message="資料庫連線失敗，未寄送任何郵件。",
+        )
+    )
+    app = make_app(
+        tmp_path,
+        RecordingSender(),
+        recipient_source=_trial_book_with_one_ok_recipient,
+        trial_report_sender=fake_sender,
+    )
+
+    response = app.route(
+        "POST", "/trial-email/send-report", form={"recipient_id": ["u46"]}
+    )
+
+    assert response.status == HTTPStatus.INTERNAL_SERVER_ERROR
+    assert "資料庫連線失敗" in response.text
+
+
+def test_send_trial_report_sender_raises_returns_500_without_leaking_details(
+    tmp_path: Path,
+) -> None:
+    """sender 拋出未預期例外 → 500，畫面不得出現例外訊息本身（不洩漏內部細節）。"""
+
+    def _boom(recipient: Recipient, *, staff_bcc: tuple = ()) -> TrialReportResult:
+        raise RuntimeError("pymysql.err.OperationalError: (2003, boom secret detail)")
+
+    app = make_app(
+        tmp_path,
+        RecordingSender(),
+        recipient_source=_trial_book_with_one_ok_recipient,
+        trial_report_sender=_boom,
+    )
+
+    response = app.route(
+        "POST", "/trial-email/send-report", form={"recipient_id": ["u46"]}
+    )
+
+    assert response.status == HTTPStatus.INTERNAL_SERVER_ERROR
+    assert "boom secret detail" not in response.text
+
+
+def test_send_trial_report_route_revalidates_days_even_if_frontend_disabled_was_bypassed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """核心安全性測試：即使前端 disabled 被繞過直接送出表單，伺服器仍會重算天數擋下。
+
+    這裡刻意**不注入假的 trial_report_sender**——用 SmsWebApp 的預設值，也就是
+    真正的 ``web.trial_report.send_trial_report``，全程走到真實的驗證邏輯，才真正
+    證明「伺服器端會自己重算」而不是「假 sender 剛好回傳失敗」。已用天數 < 天數
+    這條分支在真正碰觸 DB **之前**就會被擋下，所以這裡不會真的連線 acfh_api，
+    只把稽核檔位置導去 tmp_path，避免污染 repo 的 logs/ 目錄。
+    """
+    monkeypatch.setenv(
+        "MITAKE_WEB_TRIAL_AUDIT_PATH", str(tmp_path / "trial-report-audit.jsonl")
+    )
+    book = RecipientBook(
+        [
+            Recipient(
+                id="u46",
+                name="陳筱琪",
+                phone="0912345678",
+                device="體驗機",
+                borrow_date="2026-07-01",
+                match_status="ok",
+                days="14",
+                used_days="3",  # 尚未達標：devtools 拿掉 disabled 也不該真的寄出去
+                business="王小明",
+                trial_status="🟢 體驗中",
+            ),
+        ],
+    )
+    app = make_app(tmp_path, RecordingSender(), recipient_source=lambda: book)
+
+    response = app.route(
+        "POST", "/trial-email/send-report", form={"recipient_id": ["u46"]}
+    )
+
+    assert response.status == HTTPStatus.BAD_REQUEST
+    assert "天數" in response.text
+    # 稽核檔案要真的落地在我們指定的 tmp_path，而不是悄悄寫進 repo 的 logs/。
+    audit_path = tmp_path / "trial-report-audit.jsonl"
+    assert audit_path.exists()

@@ -26,7 +26,7 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 
-__all__ = ["Recipient", "RecipientBook", "load_recipients"]
+__all__ = ["Recipient", "RecipientBook", "load_recipients", "parse_acfh_user_id"]
 
 logger = logging.getLogger("mitake.web.recipients")
 
@@ -37,6 +37,11 @@ _SELECTABLE_STATUS = "ok"
 # match_status 缺漏或型別錯時的保守預設：一律當成「不可選」。寧可少發（使用者
 # 看得到但選不了、去問 producer），也不要把一筆狀態不明的資料當成 ok 而誤發簡訊。
 _FALLBACK_STATUS = "not_found"
+
+# Recipient.id 的前綴（tools/build_recipients.py 產生時固定用 id_prefix="u"，
+# 例如 "u46" 對應 acfh_api.users.id=46）。這裡只是**目前**的慣例，不是這個類別
+# 強制的格式——見 parse_acfh_user_id 的 docstring：格式不符一律回 None，不假設。
+_ACFH_USER_ID_PREFIX = "u"
 
 
 @dataclass(frozen=True)
@@ -70,6 +75,17 @@ class Recipient:
         那個保證（producer 是另一支程式，可能有 bug），自己再驗一次 phone 非空。
         """
         return self.match_status == _SELECTABLE_STATUS and bool(self.phone)
+
+    @property
+    def acfh_user_id(self) -> int | None:
+        """從 :attr:`id`（例如 ``"u46"``）解析出 acfh_api 的 ``users.id``（int）。
+
+        給 :mod:`web.trial_report` 用：體驗報告要去 acfh_api 查裝置與 email，
+        必須先知道這是哪個 user_id。解析失敗（見 :func:`parse_acfh_user_id`）
+        回傳 ``None``，**不拋例外**——呼叫端（伺服器路由）不該因為一筆格式怪異的
+        id 就整支請求 500，而是把它當成「查無此人」擋下。
+        """
+        return parse_acfh_user_id(self.id)
 
 
 class RecipientBook:
@@ -117,6 +133,28 @@ class RecipientBook:
     def is_empty(self) -> bool:
         """名單是否為空。空名單 → 表單維持手動輸入（與現況完全一致）。"""
         return not self._recipients
+
+
+def parse_acfh_user_id(recipient_id: str) -> int | None:
+    """把 ``"u46"`` 這種 Recipient id 解析成 acfh_api 的 ``users.id``（``46``）。
+
+    **格式不保證乾淨**：``tools/build_recipients.py`` 目前固定用
+    ``id_prefix="u"`` 產生這個欄位，但這只是「目前」的 producer 行為 —— 未來
+    有人改了 prefix、或有人手動塞測試資料，格式都可能不符。所以這裡不假設，
+    只信兩件事：開頭是 :data:`_ACFH_USER_ID_PREFIX`、其餘是純數字；不符合就
+    回傳 ``None``，**絕不拋例外**（呼叫端把它當成「無法解析」擋下即可，
+    不該因為一筆髒 id 就讓整支請求崩潰）。
+
+    非字串輸入（型別錯）同樣回 ``None``，不假設呼叫端一定傳對型別。
+    """
+    if not isinstance(recipient_id, str):
+        return None
+    if not recipient_id.startswith(_ACFH_USER_ID_PREFIX):
+        return None
+    digits = recipient_id[len(_ACFH_USER_ID_PREFIX):]
+    if not digits.isdigit():
+        return None
+    return int(digits)
 
 
 def _parse_recipient(entry: dict[str, object]) -> Recipient | None:
