@@ -2258,7 +2258,7 @@ def test_dropdown_rejects_untrusted_id_and_empty_book_falls_back_to_manual(
 
 
 def test_trial_email_renders_table_of_trials(tmp_path: Path) -> None:
-    """注入名單後，`/trial-email` 出一張表格：七個表頭 + 每筆 recipient 一列。
+    """注入名單後，`/trial-email` 出一張表格：這七個表頭都在 + 每筆 recipient 一列。
 
     鏡像 AIHCR 體驗借出管理頁（設備／客戶／接機日／天數／已用天／業務／狀態）。
     驗某筆的 device/name/business/trial_status 值都出現，且**不含**電話號碼
@@ -2355,6 +2355,128 @@ def test_trial_email_escapes_cell_values(tmp_path: Path) -> None:
 
     assert "<script>x</script>" not in text
     assert "&lt;script&gt;x&lt;/script&gt;" in text
+
+
+def test_trial_email_send_report_button_enabled_when_used_days_reaches_total(
+    tmp_path: Path,
+) -> None:
+    """已用天數 == 天數（乾淨數字字串）→「寄送體驗報告」按鈕要可點（無 disabled）。
+
+    這是按鈕啟用規則的 happy path：兩個欄位都能解析成乾淨整數，且已達標，
+    對應「已用天 >= 天數」時按鈕可點的規則。
+    """
+    book = RecipientBook(
+        [
+            Recipient(
+                id="u1",
+                name="測試",
+                phone=None,
+                device="體驗機",
+                borrow_date="2026-07-29",
+                match_status="ok",
+                days="14",
+                used_days="14",
+                business="王小明",
+                trial_status="🟢 體驗中",
+            ),
+        ],
+    )
+    app = make_app(tmp_path, RecordingSender(), recipient_source=lambda: book)
+
+    text = app.route("GET", "/trial-email").text
+
+    assert "寄送體驗報告" in text
+    assert "<button" in text
+    # 抓出這顆按鈕的完整標籤，確認裡面沒有 disabled 屬性。
+    match = re.search(r'<button type="button" class="send-report-btn"[^>]*>', text)
+    assert match is not None
+    assert "disabled" not in match.group()
+
+
+def test_trial_email_send_report_button_disabled_when_used_days_below_total(
+    tmp_path: Path,
+) -> None:
+    """已用天數 < 天數 → 按鈕要灰階不可點（含 disabled 屬性）。
+
+    這是啟用規則的邊界案例：還沒體驗到期，不該讓人誤按去寄體驗報告。
+    """
+    book = RecipientBook(
+        [
+            Recipient(
+                id="u1",
+                name="測試",
+                phone=None,
+                device="體驗機",
+                borrow_date="2026-07-29",
+                match_status="ok",
+                days="14",
+                used_days="3",
+                business="王小明",
+                trial_status="🟢 體驗中",
+            ),
+        ],
+    )
+    app = make_app(tmp_path, RecordingSender(), recipient_source=lambda: book)
+
+    text = app.route("GET", "/trial-email").text
+
+    match = re.search(r'<button type="button" class="send-report-btn"[^>]*>', text)
+    assert match is not None
+    assert "disabled" in match.group()
+
+
+def test_trial_email_send_report_button_handles_real_world_day_formats(
+    tmp_path: Path,
+) -> None:
+    """整合案例：線上實際資料格式（帶「天」字、空字串）都要能正確解析、不能讓渲染整頁失敗。
+
+    producer 從 AIHCR innerText 原樣帶下來的天數欄位格式不保證乾淨（使用者截圖顯示
+    實際格式是「14 天」而非「14」），單元測試裡其他既有案例用的都是乾淨數字字串，
+    這裡補上真實格式與完全解析不出數字（空字串）兩種情況的健壯性驗證。
+    """
+    book = RecipientBook(
+        [
+            Recipient(
+                id="u1",
+                name="陳筱琪",
+                phone=None,
+                device="體驗機A",
+                borrow_date="2026-07-29",
+                match_status="ok",
+                days="14 天",
+                used_days="14 天",
+                business="王小明",
+                trial_status="🟢 體驗中",
+            ),
+            Recipient(
+                id="u2",
+                name="李小華",
+                phone=None,
+                device="體驗機B",
+                borrow_date="2026-07-20",
+                match_status="ok",
+                days="14",
+                used_days="",
+                business="李大同",
+                trial_status="🟢 體驗中",
+            ),
+        ],
+    )
+    app = make_app(tmp_path, RecordingSender(), recipient_source=lambda: book)
+
+    response = app.route("GET", "/trial-email")
+
+    # 不能因為格式怪異就讓整頁渲染失敗（500 或例外）。
+    assert response.status == HTTPStatus.OK
+    text = response.text
+    assert "寄送體驗報告" in text
+
+    buttons = re.findall(r'<button type="button" class="send-report-btn"[^>]*>', text)
+    assert len(buttons) == 2
+    # 第一筆「14 天」/「14 天」解析成功且已達標 → 可點。
+    assert "disabled" not in buttons[0]
+    # 第二筆 used_days 為空字串、解析不出數字 → 保守預設不可點。
+    assert "disabled" in buttons[1]
 
 
 # --------------------------------------------------------------------------- #

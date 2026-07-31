@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import re
 from html import escape as _e
 from typing import TYPE_CHECKING
 from urllib.parse import quote as _q
@@ -153,6 +154,10 @@ table.trials { width: 100%; border-collapse: collapse; font-size: .88rem; }
 table.trials th, table.trials td { text-align: left; padding: .5rem .6rem;
   border-bottom: 1px solid #dde1e6; }
 table.trials thead th { font-weight: 700; background: #eef0f3; }
+table.trials button.send-report-btn { padding: .3rem .7rem; font-size: .82rem;
+  border: 1px solid #c9ced6; border-radius: 4px; background: #fff; cursor: pointer; }
+table.trials button.send-report-btn[disabled] { color: #9aa1ab; background: #f2f3f5;
+  border-color: #e1e4e8; cursor: not-allowed; }
 """
 
 # 訊息範本的**單一真相來源**。radio 快選與（未來若需要的）測試都從這裡取值，
@@ -435,6 +440,17 @@ def _format_status_time(raw: str | None) -> str:
             f"{text[8:10]}:{text[10:12]}:{text[12:14]}（台灣時間）"
         )
     return text
+
+
+def _parse_trial_day_count(value: str) -> int | None:
+    """從「14」「14天」「14 天」等體驗天數欄位取出開頭的整數；解析不出來回 None。
+
+    ``days``/``used_days`` 是 producer 從 AIHCR 頁面 innerText 原樣帶下來的字串，
+    格式不保證乾淨（可能夾雜「天」字或其他字元）。這裡只信任開頭的數字，其餘一律
+    忽略；完全解析不出數字（空字串、非數字開頭）回 None，讓呼叫端走保守預設。
+    """
+    match = re.match(r"\d+", value)
+    return int(match.group()) if match else None
 
 
 # 分類 →（方塊樣式, 標題）。key 必須與 ``mitake.DELIVERY_*`` 的值完全一致。
@@ -940,10 +956,13 @@ def render_trial_email(book: "RecipientBook") -> str:
     """「體驗借出管理」頁（``GET /trial-email``）。
 
     鏡像 AIHCR 的體驗借出管理頁：把 producer 產出、consumer 解析後的體驗借出名單
-    渲染成一張唯讀表格（設備／客戶／接機日／天數／已用天／業務／狀態）。**純唯讀**——
-    這頁不寄任何郵件、不送出任何表單、不花任何一點。資料同樣讀 producer 產的
-    recipients.json（本服務在 VPS、到不了內網，只能靠這份快照），欄位缺漏一律顯示
-    空白、不 crash；名單空時顯示提示而非空表。
+    渲染成一張唯讀表格（設備／客戶／接機日／天數／已用天／業務／狀態／寄送體驗報告）。
+    最後一欄「寄送體驗報告」是一顆按鈕，依該列已用天數是否達到天數決定可否點擊
+    （見 :func:`_parse_trial_day_count`），但**目前沒有接任何 onclick／表單提交／
+    後端動作，純粹是外觀 placeholder**，實際寄送行為之後才會補上。除了這顆按鈕，
+    整頁**仍是純唯讀**——這頁不寄任何郵件、不送出任何表單、不花任何一點。資料同樣讀
+    producer 產的 recipients.json（本服務在 VPS、到不了內網，只能靠這份快照），
+    欄位缺漏一律顯示空白、不 crash；名單空時顯示提示而非空表。
 
     刻意**不顯示電話欄**：鏡像 AIHCR 之外，也避免在這個唯讀頁把號碼攤在畫面上被
     肩窺／截圖（真正要用到號碼的是發送流程，那裡以 id 在伺服器端反查，見 web.server）。
@@ -972,6 +991,12 @@ def render_trial_email(book: "RecipientBook") -> str:
     # 這是本檔「任何進入 HTML 的輸入都先跳脫」那條規則，不為「來自名單」開特例。
     rows = []
     for rec in book.all():
+        used = _parse_trial_day_count(rec.used_days)
+        total = _parse_trial_day_count(rec.days)
+        # 保守預設：兩者都解析成功、且已用天數 >= 總天數才可點；解析失敗一律當不可用，
+        # 與本檔既有「欄位缺漏一律不 crash、當作不可用」的風格一致。
+        is_completed = used is not None and total is not None and used >= total
+        disabled_attr = "" if is_completed else " disabled"
         rows.append(
             "<tr>"
             f"<td>{_e(rec.device)}</td>"
@@ -981,6 +1006,8 @@ def render_trial_email(book: "RecipientBook") -> str:
             f"<td>{_e(rec.used_days)}</td>"
             f"<td>{_e(rec.business)}</td>"
             f"<td>{_e(rec.trial_status)}</td>"
+            f'<td><button type="button" class="send-report-btn"{disabled_attr}>'
+            "寄送體驗報告</button></td>"
             "</tr>\n"
         )
     parts.append(
@@ -988,7 +1015,7 @@ def render_trial_email(book: "RecipientBook") -> str:
         '<table class="trials">\n'
         "<thead><tr>"
         "<th>設備</th><th>客戶</th><th>接機日</th><th>天數</th>"
-        "<th>已用天</th><th>業務</th><th>狀態</th>"
+        "<th>已用天</th><th>業務</th><th>狀態</th><th>寄送體驗報告</th>"
         "</tr></thead>\n"
         f"<tbody>\n{''.join(rows)}</tbody>\n"
         "</table>\n"
