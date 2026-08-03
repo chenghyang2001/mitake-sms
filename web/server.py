@@ -80,6 +80,8 @@ if _REPO_ROOT not in sys.path:
 
 import mitake  # noqa: E402  （必須等 sys.path 補完才 import）
 
+from web import batch_recipients  # noqa: E402
+from web import multipart  # noqa: E402
 from web import recipients  # noqa: E402
 from web import templates  # noqa: E402
 from web import trial_report  # noqa: E402
@@ -97,6 +99,7 @@ __all__ = [
     "ENV_MYSQL_RD2_PASSWORD",
     "ENV_STAFF_BCC",
     "STATUS_QUERY_WINDOW_SECONDS",
+    "PendingBatchSend",
     "PendingSend",
     "RateLimitExceededError",
     "RateLimiter",
@@ -151,6 +154,15 @@ MAX_LIVE_TOKENS = 256
 # 真正的成本護欄是 max_segments。
 MAX_REQUEST_BODY_BYTES = 64 * 1024
 
+# multipart 請求（含上傳的名單檔案，見多人模式）另開一個比一般表單更高的位元組上限。
+# 抓法：batch_recipients.MAX_BATCH_RECIPIENTS 筆 × 每行 256 bytes 的安全係數
+# （正常一支手機號碼＋換行遠低於此，256 bytes 是留給行內夾雜空白／全形字元／
+# 誤貼欄位的餘裕）——沒有算進 multipart 本身的 boundary／標頭開銷，但那只有數百
+# bytes，相對這個量級可以忽略。這個上限只套用在 multipart 請求；一般表單
+# （application/x-www-form-urlencoded，個人模式沒上傳檔案時）仍是
+# MAX_REQUEST_BODY_BYTES，不放寬。
+MAX_MULTIPART_BODY_BYTES = batch_recipients.MAX_BATCH_RECIPIENTS * 256
+
 SERVER_VERSION = "MitakeWeb/1.0"
 
 ENV_HOST = "MITAKE_WEB_HOST"
@@ -189,6 +201,7 @@ ENV_STAFF_BCC = "MITAKE_WEB_STAFF_BCC"
 CSP_NONCE_BYTES = 16
 
 _FORM_CONTENT_TYPE = "application/x-www-form-urlencoded"
+_MULTIPART_CONTENT_TYPE = "multipart/form-data"
 
 
 # --------------------------------------------------------------------------- #
@@ -310,6 +323,27 @@ class RateLimiter:
         """退還額度。只在**確定沒扣點**的失敗路徑呼叫；不確定就不退（保守）。"""
         with self._lock:
             self._events = [e for e in self._events if int(e[2]) != reservation_id]
+
+    def release_partial(self, reservation_id: int, amount: int) -> None:
+        """退還一筆預約中的**部分**額度。
+
+        給批次發送用：``/send`` 對整批一次性 ``reserve()`` 總則數，送完後只退
+        「確定沒扣點」的那幾筆，不是全有全無（見
+        doc/spec-multi-recipient-sms.md §4-§5）——:meth:`release` 會整筆刪掉那個
+        預約，不適合「一部分退、一部分不退」的情境，所以另開這支方法。
+
+        ``amount`` 大於等於原始 cost 時等同整筆退還；``amount <= 0`` 或原本就找不到
+        這筆預約時安靜地不做任何事——防呆用途，呼叫端算錯退款數字不該讓整個批次
+        發送流程炸掉（那時已經有簡訊真的送出去了）。
+        """
+        if amount <= 0:
+            return
+        with self._lock:
+            for event in self._events:
+                if int(event[2]) == reservation_id:
+                    event[1] = max(0.0, event[1] - float(amount))
+                    break
+            self._events = [e for e in self._events if e[1] > 0.0]
 
     def seed(self, cost: int, age_seconds: float) -> bool:
         """補進一筆「發生在 ``age_seconds`` 秒前」的用量，回傳是否採計。
@@ -445,6 +479,28 @@ class PendingSend:
     recipient_name: str | None = None
 
 
+@dataclass(frozen=True)
+class PendingBatchSend:
+    """批次確認頁背後的待送內容（多人模式）。存在伺服器端，不隨表單來回。
+
+    與 :class:`PendingSend` 分開成獨立資料結構，而不是把 ``PendingSend.phone: str``
+    硬改成 ``phones: list[str]``：兩者的送出流程完全不同（單人是一次呼叫、多人是
+    依序 N 次呼叫 + 三分類統計，見 :meth:`SmsWebApp._handle_send_batch`），共用同一個
+    dataclass 只會讓兩條邏輯的欄位語意互相牽絆（例如 ``segments``/``chars`` 對單人
+    是「這一則」的則數／字數，對批次若疊在同一個欄位上會混淆成「這一則」還是
+    「全部人加總」）。
+
+    token 存的是**這一整組**要送的號碼，前端拿不到也改不了這組號碼——與單人模式
+    同一條鐵律（見 doc/spec-multi-recipient-sms.md §4）。
+    """
+
+    phones: list[str]
+    body: str
+    segments: int  # 單一收件人的則數（不含人數）；共扣點數 = segments * len(phones)
+    chars: int
+    issued_at: float
+
+
 class TokenError(Exception):
     """token 不可用的基底例外。"""
 
@@ -455,6 +511,18 @@ class TokenUnknownError(TokenError):
 
 class TokenExpiredError(TokenError):
     """token 存在但已超過 TTL。"""
+
+
+def _describe_pending_for_eviction_log(pending: "PendingSend | PendingBatchSend") -> str:
+    """給 :class:`TokenStore` 淘汰最舊 token 時的 log 用：依型別給出可辨識的摘要。
+
+    單人與批次的「這張確認頁是誰、送給誰」摘要方式不同（一支號碼 vs. 一組人數），
+    抽成獨立函式讓 :meth:`TokenStore._store` 不必為兩種型別各寫一段幾乎一樣的
+    ``logger.warning``。
+    """
+    if isinstance(pending, PendingBatchSend):
+        return f"批次 {len(pending.phones)} 人、{pending.segments} 則、{pending.chars} 字"
+    return f"號碼 {mask_phone(pending.phone)}、{pending.segments} 則、{pending.chars} 字"
 
 
 class TokenStore:
@@ -483,7 +551,10 @@ class TokenStore:
         self._max_tokens = max_tokens
         self._clock = clock
         self._lock = threading.Lock()
-        self._tokens: dict[str, PendingSend] = {}
+        # 單人（PendingSend）與批次（PendingBatchSend）共用同一個 token 空間——
+        # 同一組淘汰規則、同一組 TTL、同一組上限，不必為批次另開一組計數
+        # （見 :meth:`issue_batch` 的說明）。
+        self._tokens: dict[str, "PendingSend | PendingBatchSend"] = {}
 
     @property
     def ttl_seconds(self) -> float:
@@ -499,6 +570,37 @@ class TokenStore:
         for key in expired:
             del self._tokens[key]
 
+    def _store(self, pending: "PendingSend | PendingBatchSend") -> str:
+        """把已建好的 pending 物件放進 store，回傳新 token。
+
+        單人（:meth:`issue`）與批次（:meth:`issue_batch`）共用這段「換 token、
+        清過期、超過上限淘汰最舊」邏輯，避免兩處各自維護一份幾乎一模一樣的規則
+        （曾經的教訓：兩份規則一旦分岔，其中一邊忘了同步改就是一個不會被測試
+        抓到的行為差異）。
+        """
+        now = pending.issued_at
+        # 32 bytes = 256 bit 熵。urlsafe 才能安全塞進 HTML 屬性與表單欄位。
+        token = secrets.token_urlsafe(32)
+        with self._lock:
+            self._purge(now)
+            while len(self._tokens) >= self._max_tokens:
+                oldest = min(self._tokens, key=lambda key: self._tokens[key].issued_at)
+                evicted = self._tokens.pop(oldest)
+                # 被淘汰的那張確認頁按下送出時，看到的會是「此請求已處理過，或這張
+                # 確認頁已被較新的取代」的 409 —— 而使用者當下多半想不到自己開過
+                # 256 張確認頁。這行是事後唯一能把兩件事對起來的線索，所以要記到
+                # 足以比對的程度，不能只說「淘汰了一張」。
+                logger.warning(
+                    "待確認 token 已達上限 %s，淘汰最舊的一張："
+                    "發出後 %.0f 秒、%s。"
+                    "該確認頁按下送出只會看到 409，不會送出簡訊、不會扣點。",
+                    self._max_tokens,
+                    now - evicted.issued_at,
+                    _describe_pending_for_eviction_log(evicted),
+                )
+            self._tokens[token] = pending
+        return token
+
     def issue(
         self,
         *,
@@ -508,47 +610,43 @@ class TokenStore:
         chars: int,
         recipient_name: str | None = None,
     ) -> str:
-        """產生一次性 token 並記住待送內容。
+        """產生一次性 token 並記住待送內容（單人模式）。
 
         ``recipient_name`` 是選填的顯示用姓名（下拉選單模式才有值），選填是為了讓
         既有手動輸入路徑不必傳它；它只跟著 :class:`PendingSend` 走到確認頁／成功頁
         顯示，不影響發送 —— 真正送到哪個號碼永遠由 ``phone`` 決定。
         """
-        now = self._clock()
-        # 32 bytes = 256 bit 熵。urlsafe 才能安全塞進 HTML 屬性與表單欄位。
-        token = secrets.token_urlsafe(32)
         pending = PendingSend(
             phone=phone,
             body=body,
             segments=segments,
             chars=chars,
-            issued_at=now,
+            issued_at=self._clock(),
             recipient_name=recipient_name,
         )
-        with self._lock:
-            self._purge(now)
-            while len(self._tokens) >= self._max_tokens:
-                oldest = min(self._tokens, key=lambda key: self._tokens[key].issued_at)
-                evicted = self._tokens.pop(oldest)
-                # 被淘汰的那張確認頁按下送出時，看到的會是「此請求已處理過，或這張
-                # 確認頁已被較新的取代」的 409 —— 而使用者當下多半想不到自己開過
-                # 256 張確認頁。這行是事後唯一能把兩件事對起來的線索，所以要記到
-                # 足以比對的程度（發出多久、給誰、幾則），不能只說「淘汰了一張」。
-                logger.warning(
-                    "待確認 token 已達上限 %s，淘汰最舊的一張："
-                    "發出後 %.0f 秒、號碼 %s、%s 則、%s 字。"
-                    "該確認頁按下送出只會看到 409，不會送出簡訊、不會扣點。",
-                    self._max_tokens,
-                    now - evicted.issued_at,
-                    mask_phone(evicted.phone),
-                    evicted.segments,
-                    evicted.chars,
-                )
-            self._tokens[token] = pending
-        return token
+        return self._store(pending)
 
-    def consume(self, token: object) -> PendingSend:
-        """驗證並**立即作廢** token，回傳待送內容。
+    def issue_batch(
+        self, *, phones: list[str], body: str, segments: int, chars: int
+    ) -> str:
+        """產生一次性 token 並記住待送的一整組批次內容（多人模式）。
+
+        與 :meth:`issue` 共用同一個 token 空間（見 :attr:`_tokens` 旁的說明）——
+        批次與單人共用「未使用 token 上限」是刻意的，不必為批次另開一組計數。
+        """
+        pending = PendingBatchSend(
+            phones=list(phones),
+            body=body,
+            segments=segments,
+            chars=chars,
+            issued_at=self._clock(),
+        )
+        return self._store(pending)
+
+    def consume(self, token: object) -> "PendingSend | PendingBatchSend":
+        """驗證並**立即作廢** token，回傳待送內容（單人 :class:`PendingSend` 或
+        批次 :class:`PendingBatchSend`，呼叫端依 ``isinstance`` 分流，見
+        :meth:`SmsWebApp.handle_send`）。
 
         不論成功或過期都會把它從 store 移除：留著只會讓「已經用過」與
         「還能再用一次」的界線變模糊，而模糊的那一邊就是多送一封簡訊。
@@ -887,6 +985,7 @@ class SmsWebApp:
         headers: Any = None,
         *,
         query: Mapping[str, Sequence[str]] | None = None,
+        files: Mapping[str, bytes] | None = None,
     ) -> Response:
         """把 (method, path, form, headers) 對應到回應。HTTP 層只負責把參數餵進來。
 
@@ -899,8 +998,14 @@ class SmsWebApp:
         ``GET /status`` 用**。它是後加的 keyword-only 參數，既有呼叫端
         （含測試）不傳也完全不受影響。刻意與 ``form`` 分開：花錢的 ``/send``
         只吃 POST body，永遠不該從網址列取值。
+
+        ``files`` 是 multipart 請求裡的檔案欄位（``web.multipart`` 的解析結果，
+        形狀 ``dict[str, bytes]``），**只給 ``POST /preview`` 的多人模式用**
+        （上傳的名單檔案）。同樣是後加的 keyword-only 參數，不傳就是空 dict，
+        既有呼叫端（含所有既有測試）完全不受影響。
         """
         form = form if form is not None else {}
+        files = files if files is not None else {}
         # /health 在存取檢查**之前**處理：systemd / 監控探測不會帶 Access 標頭，
         # 擋掉它等於讓服務被誤判成掛掉並反覆重啟。這個端點只回「服務活著」，
         # 不查餘額、不碰憑證、不花錢（見 handle_health），豁免的代價是零。
@@ -914,7 +1019,11 @@ class SmsWebApp:
         if path == "/":
             return self.handle_index() if method == "GET" else self._method_not_allowed()
         if path == "/preview":
-            return self.handle_preview(form) if method == "POST" else self._method_not_allowed()
+            return (
+                self.handle_preview(form, files=files)
+                if method == "POST"
+                else self._method_not_allowed()
+            )
         if path == "/send":
             return self.handle_send(form) if method == "POST" else self._method_not_allowed()
         if path == templates.STATUS_PATH:
@@ -1027,6 +1136,7 @@ class SmsWebApp:
             rate_used=snapshot.used,
             rate_limit=snapshot.limit,
             recipients=book,
+            max_batch_recipients=batch_recipients.MAX_BATCH_RECIPIENTS,
         )
         return _html_response(status, markup, nonce=nonce)
 
@@ -1135,21 +1245,50 @@ class SmsWebApp:
             ),
         )
 
-    def handle_preview(self, form: Mapping[str, Sequence[str]]) -> Response:
+    def handle_preview(
+        self,
+        form: Mapping[str, Sequence[str]],
+        *,
+        files: Mapping[str, bytes] | None = None,
+    ) -> Response:
         """確認頁。所有「會被擋下」的情況都在這裡擋，不留到 ``/send`` 才報錯。
 
-        **雙模式**（由 ``recipient_id`` 欄位有無決定，互斥）：
+        依 ``send-mode`` 欄位分流成兩條完全獨立的路徑（見
+        :meth:`_handle_preview_batch`）：值為 ``"batch"`` 才走多人模式，其餘
+        （含**沒有這個欄位**）一律走以下的個人模式 —— 這是刻意的預設方向，確保
+        新增多人模式之前的既有請求（含所有既有測試）行為完全不變。
 
-        * 下拉選單模式（``recipient_id`` 非空）：號碼**只由伺服器端**以 id 反查名單
-          取得，**完全忽略**前端另外送來的 ``phone`` 欄位 —— 防竄改的核心，前端改不了
-          真實收件人。查不到可選對象（未知 id / ambiguous / not_found）直接擋在確認頁
-          之前，不發 token、不送出。
-        * 手動輸入模式（``recipient_id`` 為空）：讀 ``phone`` 欄位，與現況完全一致。
-          名單未設定時表單本來就出手動欄位，這條路徑保留給既有行為（既有測試全走這條）。
+        個人模式**雙來源**（由 ``recipient_id`` / ``phone`` 兩個欄位決定）：
+
+        * 下拉有選、手動輸入為空：號碼**只由伺服器端**以 id 反查名單取得，
+          **完全忽略**前端另外送來的 ``phone`` 欄位 —— 防竄改的核心，前端改不了
+          真實收件人。查不到可選對象（未知 id / ambiguous / not_found）直接擋在
+          確認頁之前，不發 token、不送出。
+        * 手動輸入有值、下拉未選：讀 ``phone`` 欄位，與現況完全一致。
+        * **兩者都有值**：直接 400 擋下，不猜優先序 —— 若默默選其中一個當優先，
+          使用者會以為送去的是他手動打的那支、實際卻送到下拉選的人（或反過來），
+          這正是本專案要不惜代價避免的「畫面與實際不一致」
+          （見 doc/spec-multi-recipient-sms.md §2）。
         """
         body = _normalize_newlines(_first(form, "body"))
+
+        if _first(form, "send-mode") == "batch":
+            return self._handle_preview_batch(form, files if files is not None else {})
+
         recipient_id = _first(form, "recipient_id")
+        manual_phone_raw = _first(form, "phone")
         recipient_name: str | None = None
+
+        if recipient_id and manual_phone_raw:
+            # 兩個來源都有值：不猜優先序，整個清空回表單重填。理由見本函式 docstring。
+            return self.handle_index(
+                body=body,
+                error=(
+                    "下拉選單與手動輸入號碼請只擇一，已清空，請重新填寫。"
+                    "（尚未送出，未扣點）"
+                ),
+                status=HTTPStatus.BAD_REQUEST,
+            )
 
         if recipient_id:
             # 下拉模式：號碼一律由 book.get() 解析，忽略前端送來的 phone（防竄改）。
@@ -1165,7 +1304,7 @@ class SmsWebApp:
             phone_raw = rec.phone
             recipient_name = rec.name
         else:
-            phone_raw = _first(form, "phone")
+            phone_raw = manual_phone_raw
 
         # 下拉模式回填一律傳空號碼（靠重選）；手動模式回填原始輸入（見既有註解的理由）。
         backfill_phone = "" if recipient_id else phone_raw
@@ -1237,6 +1376,124 @@ class SmsWebApp:
             ),
         )
 
+    def _handle_preview_batch(
+        self, form: Mapping[str, Sequence[str]], files: Mapping[str, bytes]
+    ) -> Response:
+        """多人模式的確認頁邏輯（``send-mode=batch``）。
+
+        名單來源**兩擇一**：優先讀上傳的檔案（``files["recipients_file"]``）；
+        沒有檔案（或檔案是空的）時改讀 ``recipients_text`` 這個純文字欄位 ——
+        後者**只給**批次結果頁「未扣點失敗，重新確認並發送」按鈕使用（見
+        ``web.templates._hidden_batch_resend_form``），讓那個按鈕能重新走一次
+        完整的解析／驗證／去重／確認流程，而不是另開一條「信任前端傳來的號碼
+        清單」的捷徑。兩者都吃同一支 :func:`batch_recipients.parse_batch_recipients`，
+        驗證規則不因來源不同而有兩套標準。
+        """
+        body = _normalize_newlines(_first(form, "body"))
+
+        raw_file = files.get("recipients_file")
+        if raw_file:
+            try:
+                text_content = raw_file.decode("utf-8")
+            except UnicodeDecodeError:
+                return self.handle_index(
+                    body=body,
+                    error="檔案編碼有誤，請存成 UTF-8 純文字檔。（尚未送出，未扣點）",
+                    status=HTTPStatus.BAD_REQUEST,
+                )
+        else:
+            text_content = _first(form, "recipients_text")
+
+        if not text_content.strip():
+            return self.handle_index(
+                body=body,
+                error="請上傳名單檔案（多人模式），檔案內每行一支手機號碼。"
+                "（尚未送出，未扣點）",
+                status=HTTPStatus.BAD_REQUEST,
+            )
+
+        parsed = batch_recipients.parse_batch_recipients(text_content)
+
+        if not parsed.valid_phones:
+            # 列出前幾行實際讀到的內容（遮罩後）方便操作者判斷「是不是選錯檔案」
+            # ——例如誤傳了帶標題列的 Excel 匯出檔，這裡讓人一眼看出讀到的不是號碼。
+            preview_lines = [
+                mask_phone(item.raw_line) for item in parsed.skipped[:3]
+            ]
+            preview_text = "、".join(preview_lines) if preview_lines else "（檔案內容為空）"
+            return self.handle_index(
+                body=body,
+                error=(
+                    "檔案中沒有可發送的有效號碼。（尚未送出，未扣點）"
+                    f"實際讀到的內容例如：{preview_text}"
+                ),
+                status=HTTPStatus.BAD_REQUEST,
+            )
+
+        if len(parsed.valid_phones) > batch_recipients.MAX_BATCH_RECIPIENTS:
+            return self.handle_index(
+                body=body,
+                error=(
+                    f"單次名單不可超過 {batch_recipients.MAX_BATCH_RECIPIENTS} 筆"
+                    f"（本次讀到 {len(parsed.valid_phones)} 筆有效號碼），請分批上傳。"
+                    "（尚未送出，未扣點）"
+                ),
+                status=HTTPStatus.BAD_REQUEST,
+            )
+
+        if not body.strip():
+            return self.handle_index(
+                body=body,
+                error="簡訊內容不可為空白（只有空白字元也不行）。",
+                status=HTTPStatus.BAD_REQUEST,
+            )
+
+        segments, chars = mitake.count_sms_segments(body)
+        if segments > self._max_segments:
+            return self.handle_index(
+                body=body,
+                error=(
+                    f"內容 {chars} 字＝{segments} 則＝每人扣 {segments} 點，"
+                    f"超過單次上限 {self._max_segments} 則。請縮短內容後再試。"
+                ),
+                status=HTTPStatus.BAD_REQUEST,
+            )
+
+        total_cost = len(parsed.valid_phones) * segments
+        try:
+            self._rate.check(total_cost)
+        except RateLimitExceededError as exc:
+            return self.handle_index(
+                body=body,
+                error=(
+                    f"{len(parsed.valid_phones)} 人 × {segments} 則 = 共 {total_cost} 則，"
+                    f"超過本小時上限。{exc}本次未送出，也沒有扣點。"
+                    "請調整名單筆數，或稍後再重新上傳同一份檔案確認。"
+                ),
+                status=HTTPStatus.TOO_MANY_REQUESTS,
+            )
+
+        token = self._tokens.issue_batch(
+            phones=parsed.valid_phones, body=body, segments=segments, chars=chars
+        )
+        logger.info(
+            "產生批次確認頁：將發送 %s 人、跳過 %s 人、每人 %s 則",
+            len(parsed.valid_phones),
+            len(parsed.skipped),
+            segments,
+        )
+        return _html_response(
+            HTTPStatus.OK,
+            templates.render_preview_batch(
+                phones=parsed.valid_phones,
+                skipped=parsed.skipped,
+                body=body,
+                segments=segments,
+                chars=chars,
+                token=token,
+            ),
+        )
+
     def handle_send(self, form: Mapping[str, Sequence[str]]) -> Response:
         """實際發送。**這是唯一會花錢的路徑。**"""
         try:
@@ -1276,6 +1533,12 @@ class SmsWebApp:
                     ),
                 ),
             )
+
+        if isinstance(pending, PendingBatchSend):
+            # 批次模式：完全獨立的送出迴圈（依序逐筆呼叫 sender + 三分類統計），
+            # 見 :meth:`_handle_send_batch`。單人模式的邏輯（token 已消耗、以下這段）
+            # 對批次沒有意義（沒有單一個 pending.phone），提前分流。
+            return self._handle_send_batch(pending)
 
         try:
             reservation = self._rate.reserve(pending.segments)
@@ -1352,6 +1615,270 @@ class SmsWebApp:
             )
 
         return self._succeed(request_id, pending, result)
+
+    def _handle_send_batch(self, pending: PendingBatchSend) -> Response:
+        """批次模式的實際送出。**依序、不平行**（見
+        doc/spec-multi-recipient-sms.md §5-1）：平行打三竹在短時間內會被限流，
+        而那會連個人模式的發送一起壞掉（同 ``StatusQueryThrottle`` docstring
+        的顧慮）。
+
+        每支號碼各自呼叫一次 ``self._sender``，結果依 ``possibly_charged`` 分成
+        三類（比照單人模式 :meth:`_handle_api_error` 的判斷邏輯，但這裡是**累積
+        成清單**而非直接渲染單一頁面）：已送達三竹、確定沒扣點失敗、可能已扣點
+        未確認。整批共用一個 ``batch_id``（本次批次的 uuid），讓事後在稽核檔裡
+        能用同一個值把這批的 N 筆記錄串起來；每筆仍各自有獨立的 request_id
+        （沿用既有單筆稽核慣例）。
+
+        **稽核寫入是否成功也要逐筆追蹤**（沿用單人模式 ``_succeed`` /
+        ``_fail_unconfirmed`` 對 ``audit_ok`` 的同一套語意）：``record_attempt``
+        與 ``record_result`` 任一筆回傳 ``False``，就代表磁碟滿或稽核檔路徑不可寫
+        —— 稽核檔是事後唯一能回答「這一點是誰燒的」的東西，寫失敗卻讓畫面顯示
+        一片乾淨的「已送達」會讓操作者完全不知道這批可能沒留底。凡是失敗的那幾筆
+        都收進 ``audit_failures``，交給 :func:`web.templates.render_batch_result`
+        渲染成醒目警示框，列出遮罩號碼與（若有）msgid，要求操作者立刻手動記下。
+
+        速率額度**一次性整批預約**，送完後只退「確定沒扣點」的那幾筆（見
+        :meth:`RateLimiter.release_partial`）——不是全有全無。
+
+        對「重送也不會成功」的設定類錯誤（IP 不在白名單／帳密錯）不提供重送：
+        這兩種 kind 是整個帳號層級的問題，不會因為換一支號碼重送就解決，
+        給重送入口只是誘人對著整份名單白按。
+        """
+        total_cost = len(pending.phones) * pending.segments
+        try:
+            reservation = self._rate.reserve(total_cost)
+        except RateLimitExceededError as exc:
+            # token 已消耗（一次性）。批次沒有簡單的「帶著整份名單回填」機制——
+            # 那要嘛是一個巨大的隱藏表單，要嘛是重新引入「信任前端傳來的號碼
+            # 清單」的風險，兩者都不划算，所以這裡只講清楚狀況，請操作者重新
+            # 上傳同一份檔案再走一次確認頁。
+            return _html_response(
+                HTTPStatus.TOO_MANY_REQUESTS,
+                templates.render_notice(
+                    title="超過發送上限",
+                    heading="超過發送上限",
+                    message=f"{exc}本次未送出，也沒有扣點。",
+                    hint="請稍後重新上傳同一份名單檔案，重新走一次確認頁。",
+                ),
+            )
+
+        batch_id = self._request_id_factory()
+        sent: list[dict[str, object]] = []
+        not_charged: list[dict[str, object]] = []
+        unconfirmed: list[dict[str, object]] = []
+        audit_failures: list[dict[str, object]] = []
+
+        def _note_audit_outcome(
+            *, attempt_ok: bool, result_ok: bool, phone: str, msgid: object = None
+        ) -> None:
+            """兩筆稽核寫入（attempt/result）任一失敗，就記到 audit_failures。"""
+            if not (attempt_ok and result_ok):
+                audit_failures.append({"phone": phone, "msgid": msgid})
+
+        logger.info(
+            "開始批次發送：batch_id=%s 共 %s 人、每人 %s 則",
+            batch_id,
+            len(pending.phones),
+            pending.segments,
+        )
+
+        # kind=ip_blocked / auth_failed 是帳號層級的設定問題，重送也不會成功——
+        # 沿用單人模式 _handle_api_error 對這兩種 kind 停用重送的同一套判斷。
+        non_resendable_kinds = (mitake.KIND_IP_BLOCKED, mitake.KIND_AUTH_FAILED)
+
+        for phone in pending.phones:
+            request_id = self._request_id_factory()
+            attempt_ok = self._audit.record_attempt(
+                request_id=request_id,
+                phone=phone,
+                segments=pending.segments,
+                chars=pending.chars,
+                batch_id=batch_id,
+            )
+
+            try:
+                result = self._sender(
+                    phone,
+                    pending.body,
+                    max_segments=self._max_segments,
+                    timeout=self._send_timeout,
+                )
+            except mitake.MitakeValidationError as exc:
+                result_ok = self._audit.record_result(
+                    request_id=request_id,
+                    phone=phone,
+                    segments=pending.segments,
+                    chars=pending.chars,
+                    success=False,
+                    possibly_charged=False,
+                    error_kind="validation",
+                    error_message=str(exc),
+                    batch_id=batch_id,
+                )
+                not_charged.append(
+                    {
+                        "phone": phone,
+                        "reason": templates.REASON_VALIDATION_BLOCKED,
+                        "allow_resend": True,
+                    }
+                )
+                _note_audit_outcome(
+                    attempt_ok=attempt_ok, result_ok=result_ok, phone=phone
+                )
+                continue
+            except mitake.MitakeConfigError as exc:
+                result_ok = self._audit.record_result(
+                    request_id=request_id,
+                    phone=phone,
+                    segments=pending.segments,
+                    chars=pending.chars,
+                    success=False,
+                    possibly_charged=False,
+                    error_kind="config",
+                    error_message=str(exc),
+                    batch_id=batch_id,
+                )
+                not_charged.append(
+                    {
+                        "phone": phone,
+                        "reason": templates.REASON_CONFIG_MISSING,
+                        "allow_resend": True,
+                    }
+                )
+                _note_audit_outcome(
+                    attempt_ok=attempt_ok, result_ok=result_ok, phone=phone
+                )
+                continue
+            except mitake.MitakeAPIError as exc:
+                possibly_charged = bool(getattr(exc, "possibly_charged", True))
+                kind = str(getattr(exc, "kind", mitake.KIND_API))
+                api_response = getattr(exc, "response", None)
+                msgid = (
+                    api_response.get("msgid") if isinstance(api_response, Mapping) else None
+                )
+                result_ok = self._audit.record_result(
+                    request_id=request_id,
+                    phone=phone,
+                    segments=pending.segments,
+                    chars=pending.chars,
+                    success=False,
+                    msgid=str(msgid) if msgid is not None else None,
+                    possibly_charged=possibly_charged,
+                    error_kind=kind,
+                    error_message=str(exc),
+                    batch_id=batch_id,
+                )
+                if possibly_charged:
+                    unconfirmed.append({"phone": phone, "msgid": msgid})
+                else:
+                    not_charged.append(
+                        {
+                            "phone": phone,
+                            "reason": str(exc),
+                            "allow_resend": kind not in non_resendable_kinds,
+                        }
+                    )
+                _note_audit_outcome(
+                    attempt_ok=attempt_ok, result_ok=result_ok, phone=phone, msgid=msgid
+                )
+                continue
+            except mitake.MitakeError as exc:
+                # 未分類的 MitakeError：保守當成可能已扣點（同 handle_send 的理由，
+                # 誤判成「沒扣點」的代價遠高於誤判成「可能扣了」的代價）。
+                logger.error(
+                    "批次發送失敗（未分類的 MitakeError）：batch_id=%s request_id=%s %s",
+                    batch_id,
+                    request_id,
+                    exc,
+                )
+                result_ok = self._audit.record_result(
+                    request_id=request_id,
+                    phone=phone,
+                    segments=pending.segments,
+                    chars=pending.chars,
+                    success=False,
+                    possibly_charged=True,
+                    error_kind="mitake_unknown",
+                    error_message=str(exc),
+                    batch_id=batch_id,
+                )
+                unconfirmed.append({"phone": phone, "msgid": None})
+                _note_audit_outcome(
+                    attempt_ok=attempt_ok, result_ok=result_ok, phone=phone
+                )
+                continue
+            except Exception as exc:  # noqa: BLE001 — 不讓一筆的 bug 拖垮整批的統計
+                logger.exception(
+                    "批次發送時發生未預期錯誤：batch_id=%s request_id=%s",
+                    batch_id,
+                    request_id,
+                )
+                result_ok = self._audit.record_result(
+                    request_id=request_id,
+                    phone=phone,
+                    segments=pending.segments,
+                    chars=pending.chars,
+                    success=False,
+                    possibly_charged=True,
+                    error_kind="unexpected",
+                    error_message=str(exc),
+                    batch_id=batch_id,
+                )
+                unconfirmed.append({"phone": phone, "msgid": None})
+                _note_audit_outcome(
+                    attempt_ok=attempt_ok, result_ok=result_ok, phone=phone
+                )
+                continue
+
+            msgid = result.get("msgid") if isinstance(result, Mapping) else None
+            account_point = result.get("account_point") if isinstance(result, Mapping) else None
+            result_ok = self._audit.record_result(
+                request_id=request_id,
+                phone=phone,
+                segments=pending.segments,
+                chars=pending.chars,
+                success=True,
+                msgid=msgid,
+                account_point=account_point,
+                batch_id=batch_id,
+            )
+            sent.append({"phone": phone, "msgid": msgid})
+            _note_audit_outcome(
+                attempt_ok=attempt_ok, result_ok=result_ok, phone=phone, msgid=msgid
+            )
+
+        # 只退「確定沒扣點」的那幾筆；已送達與未確認的則數視為已消耗，不退。
+        refund = len(not_charged) * pending.segments
+        self._rate.release_partial(reservation, refund)
+
+        logger.info(
+            "批次發送結束：batch_id=%s 已送達=%s 未扣點失敗=%s 未確認=%s 稽核寫入失敗=%s",
+            batch_id,
+            len(sent),
+            len(not_charged),
+            len(unconfirmed),
+            len(audit_failures),
+        )
+        if audit_failures:
+            # 這是最壞的組合：可能已花錢，卻連留底都沒有。單筆模式在同樣情況下
+            # 會拉到 ERROR（見 _fail_unconfirmed），這裡也一樣，讓維運看得到。
+            logger.error(
+                "批次發送有 %s 筆稽核紀錄寫入失敗：batch_id=%s，"
+                "這些號碼在 send-audit.jsonl 裡查不到，請立刻人工核對並補記。",
+                len(audit_failures),
+                batch_id,
+            )
+
+        return _html_response(
+            HTTPStatus.OK,
+            templates.render_batch_result(
+                sent=sent,
+                not_charged=not_charged,
+                unconfirmed=unconfirmed,
+                audit_failures=audit_failures,
+                body=pending.body,
+            ),
+        )
 
     def handle_status(
         self, query: Mapping[str, Sequence[str]] | None = None
@@ -1984,11 +2511,14 @@ def make_handler(app: SmsWebApp) -> type[BaseHTTPRequestHandler]:
                 query = (
                     parse_qs(parts.query, keep_blank_values=True) if parts.query else {}
                 )
-                form = self._read_form() if method == "POST" else {}
+                if method == "POST":
+                    form, files = self._read_request_body()
+                else:
+                    form, files = {}, {}
                 # self.headers 是 email.message.Message，.get() 不分大小寫 ——
                 # 標頭名稱的大小寫由對方決定，不能自己用 dict 查。
                 response = self._app.route(
-                    method, path, form, headers=self.headers, query=query
+                    method, path, form, headers=self.headers, query=query, files=files
                 )
             except _RequestError as exc:
                 response = _html_response(
@@ -2015,7 +2545,19 @@ def make_handler(app: SmsWebApp) -> type[BaseHTTPRequestHandler]:
                 )
             self._respond(response)
 
-        def _read_form(self) -> dict[str, list[str]]:
+        def _read_request_body(self) -> tuple[dict[str, list[str]], dict[str, bytes]]:
+            """讀取並解析 POST body，回傳 ``(表單欄位, 檔案欄位)``。
+
+            依 ``Content-Type`` 分派：
+
+            * ``application/x-www-form-urlencoded`` → 既有 ``parse_qs`` 路徑
+              （個人模式的既有行為，位元組上限維持 ``MAX_REQUEST_BODY_BYTES``，
+              不放寬；檔案欄位固定回空 dict）。
+            * ``multipart/form-data`` → 新的 ``web.multipart`` 解析器（多人模式的
+              名單上傳需要真的檔案內容），位元組上限改用較高的
+              ``MAX_MULTIPART_BODY_BYTES``（見該常數旁的說明）。
+            * 其餘 ``Content-Type`` → 400，不嘗試猜測格式硬解。
+            """
             raw_length = self.headers.get("Content-Length")
             if raw_length is None:
                 raise _RequestError(
@@ -2029,24 +2571,42 @@ def make_handler(app: SmsWebApp) -> type[BaseHTTPRequestHandler]:
                 ) from None
             if length < 0:
                 raise _RequestError(HTTPStatus.BAD_REQUEST, "Content-Length 不可為負數。")
-            if length > MAX_REQUEST_BODY_BYTES:
-                raise _RequestError(
-                    HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
-                    f"表單內容超過 {MAX_REQUEST_BODY_BYTES} 位元組上限。",
-                )
 
-            content_type = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
-            if content_type != _FORM_CONTENT_TYPE:
-                raise _RequestError(
-                    HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
-                    f"只接受 {_FORM_CONTENT_TYPE} 格式的表單。",
-                )
+            content_type_header = self.headers.get("Content-Type") or ""
+            content_type = content_type_header.split(";")[0].strip().lower()
 
-            raw = self.rfile.read(length)
-            # errors="replace"：壞掉的位元組不該讓請求 500，讓它變成一個過不了
-            # validate_phone 的字串，走正常的「號碼格式錯」流程即可。
-            text = raw.decode("utf-8", errors="replace")
-            return parse_qs(text, keep_blank_values=True)
+            if content_type == _FORM_CONTENT_TYPE:
+                if length > MAX_REQUEST_BODY_BYTES:
+                    raise _RequestError(
+                        HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                        f"表單內容超過 {MAX_REQUEST_BODY_BYTES} 位元組上限。",
+                    )
+                raw = self.rfile.read(length)
+                # errors="replace"：壞掉的位元組不該讓請求 500，讓它變成一個過不了
+                # validate_phone 的字串，走正常的「號碼格式錯」流程即可。
+                text = raw.decode("utf-8", errors="replace")
+                return parse_qs(text, keep_blank_values=True), {}
+
+            if content_type == _MULTIPART_CONTENT_TYPE:
+                if length > MAX_MULTIPART_BODY_BYTES:
+                    raise _RequestError(
+                        HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                        f"上傳內容超過 {MAX_MULTIPART_BODY_BYTES} 位元組上限，"
+                        "請分批上傳。",
+                    )
+                raw = self.rfile.read(length)
+                try:
+                    parsed = multipart.parse_multipart_form_data(raw, content_type_header)
+                except multipart.MultipartParseError as exc:
+                    raise _RequestError(
+                        HTTPStatus.BAD_REQUEST, f"上傳內容格式不符：{exc}"
+                    ) from exc
+                return parsed.fields, parsed.files
+
+            raise _RequestError(
+                HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
+                f"只接受 {_FORM_CONTENT_TYPE} 或 {_MULTIPART_CONTENT_TYPE} 格式的表單。",
+            )
 
         def _respond(self, response: Response) -> None:
             body = response.body

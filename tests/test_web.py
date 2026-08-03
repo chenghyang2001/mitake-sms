@@ -41,6 +41,7 @@ import json
 import re
 import sys
 import threading
+import urllib.error
 import urllib.request
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
@@ -59,11 +60,13 @@ if _REPO_ROOT not in sys.path:
 
 import mitake  # noqa: E402
 
+from web import batch_recipients  # noqa: E402
 from web import templates  # noqa: E402
 from web.audit import AuditLog  # noqa: E402
 from web.recipients import Recipient, RecipientBook  # noqa: E402
 from web.server import (  # noqa: E402
     ACCESS_EMAIL_HEADER,
+    MAX_MULTIPART_BODY_BYTES,
     SmsWebApp,
     TokenStore,
     _csp_header,  # 私有但刻意直測：CSP 字串是安全邊界，不該只靠端對端那一條驗
@@ -137,6 +140,31 @@ class RecordingSender:
         return len(self.calls)
 
 
+class SequencedSender:
+    """假的 `mitake.send_sms`：依呼叫順序回傳／拋出不同結果。
+
+    給批次發送「部分成功、部分失敗、部分未確認」的情境用——`RecordingSender`
+    全程只有單一固定結果／例外，模擬不出批次送出迴圈裡每一筆結果不同的情況。
+    """
+
+    def __init__(self, outcomes: "list[dict | BaseException]") -> None:
+        self._outcomes = list(outcomes)
+        self.calls: list[dict] = []
+
+    def __call__(self, phone: str, body: str, *, max_segments: int, timeout: float) -> dict:
+        self.calls.append(
+            {"phone": phone, "body": body, "max_segments": max_segments, "timeout": timeout}
+        )
+        outcome = self._outcomes[len(self.calls) - 1]
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return dict(outcome)
+
+    @property
+    def call_count(self) -> int:
+        return len(self.calls)
+
+
 class RecordingStatusQuery:
     """假的 `mitake.query_message_status`：記下每次呼叫，照設定回傳或拋出。
 
@@ -195,6 +223,17 @@ def _form(**fields: str) -> dict[str, list[str]]:
     return {key: [value] for key, value in fields.items()}
 
 
+def _batch_form(body: str, **extra: str) -> dict[str, list[str]]:
+    """組多人模式 `/preview` 的表單欄位（不含檔案，檔案另外用 `files=` 傳）。
+
+    永遠帶 `send-mode=batch`，這是伺服器端分流到批次邏輯的唯一依據
+    （見 `web.server.SmsWebApp.handle_preview`）。
+    """
+    fields = {"send-mode": "batch", "body": body}
+    fields.update(extra)
+    return _form(**fields)
+
+
 def status_result(
     statuscode: str = "4",
     *,
@@ -232,6 +271,7 @@ def make_app(
     recipient_source: "Callable[[], RecipientBook] | None" = None,
     trial_report_sender: "Callable[..., object] | None" = None,
     staff_bcc: "tuple[str, ...] | None" = None,
+    request_id_factory: "Callable[[], str] | None" = None,
 ) -> SmsWebApp:
     """建一個完全離線的 app：假 sender、假 status_query、假時鐘、稽核檔落在 tmp_path。
 
@@ -243,6 +283,11 @@ def make_app(
     ``web.trial_report.send_trial_report`` 與讀 ``MITAKE_WEB_STAFF_BCC`` 環境變數，
     但**本檔任何測試都不該讓它走到那條路徑**（會真的連 acfh_api／真的寄 Gmail）——
     凡是會呼叫 ``POST /trial-email/send-report`` 的測試都必須自己傳一個假 sender。
+
+    ``request_id_factory`` 預設 None 時維持既有的固定字串 ``"req-test"``
+    （既有測試如 ``test_unconfirmed_page_never_claims_audit_when_it_failed``
+    直接斷言這個字串會出現在畫面上，不能改成動態值）。批次發送的測試需要驗證
+    「同一批次的每一筆 request_id 各自獨立」，才會自己傳一個會遞增的 factory。
     """
     return SmsWebApp(
         sender=sender,
@@ -257,7 +302,9 @@ def make_app(
         token_ttl_seconds=token_ttl_seconds,
         token_store=token_store,
         clock=clock if clock is not None else FakeClock(),
-        request_id_factory=lambda: "req-test",
+        request_id_factory=(
+            request_id_factory if request_id_factory is not None else lambda: "req-test"
+        ),
         require_access_email=require_access_email,
         recipient_source=recipient_source,
         trial_report_sender=trial_report_sender,
@@ -2198,14 +2245,43 @@ def test_recipient_dropdown_renders_with_disabled_unselectable_entries(
     assert "0918123424" not in text
 
 
-def test_preview_resolves_phone_from_id_and_ignores_front_end_phone(
+def test_preview_rejects_recipient_id_and_manual_phone_together(
     tmp_path: Path,
 ) -> None:
-    """下拉模式：號碼由伺服器端以 id 反查，**忽略**前端另外送來的假 phone（防竄改核心）。
+    """下拉與手動輸入**兩者都有值** → 400 擋下，不猜優先序，不發 token、不送出。
 
-    故意在 POST 裡同時塞 recipient_id=u46 與一個假 phone=0900000000：確認頁與實際
-    送出的號碼都必須是名單裡 u46 的真號碼（0918123424）與姓名（陳筱琪），
-    絕不是那個假號碼。且 token 有正常發出（走得完二階段）。
+    這是 doc/spec-multi-recipient-sms.md §2 的明文規定，取代了本功能加入前的舊行為
+    （舊行為是「靜默信任 recipient_id、忽略 phone」）。理由：若默默選其中一個當
+    優先，使用者會以為送去的是他手動打的那支、實際卻送到下拉選的人（或反過來）——
+    這正是本專案要不惜代價避免的「畫面與實際不一致」。真正的防竄改改由下面
+    ``test_preview_resolves_phone_from_id_when_manual_field_is_blank`` 驗證：
+    手動欄位**留白**時，前端改不了送到誰。
+    """
+    book = sample_recipient_book()
+    sender = RecordingSender()
+    app = make_app(tmp_path, sender, recipient_source=lambda: book)
+
+    response = app.route(
+        "POST",
+        "/preview",
+        _form(recipient_id="u46", phone="0900000000", body=SHORT_BODY),
+    )
+
+    assert response.status == HTTPStatus.BAD_REQUEST
+    assert "只擇一" in response.text
+    assert _TOKEN_PATTERN.search(response.text) is None
+    assert app.token_store.pending_count == 0
+    assert sender.call_count == 0
+
+
+def test_preview_resolves_phone_from_id_when_manual_field_is_blank(
+    tmp_path: Path,
+) -> None:
+    """下拉模式：手動輸入欄位**留白**時，號碼由伺服器端以 id 反查（防竄改核心）。
+
+    新版 UI 下拉與手動輸入並存，正常瀏覽器提交時手動欄位一律會帶上（即使是空字串）
+    ——這裡驗證「有欄位但是空字串」與「完全沒有這個欄位」兩種提交方式都不算
+    衝突，仍然照 recipient_id 正常解析並走完二階段確認。
     """
     book = sample_recipient_book()
     sender = RecordingSender()
@@ -2214,13 +2290,12 @@ def test_preview_resolves_phone_from_id_and_ignores_front_end_phone(
     preview = app.route(
         "POST",
         "/preview",
-        _form(recipient_id="u46", phone="0900000000", body=SHORT_BODY),
+        _form(recipient_id="u46", phone="", body=SHORT_BODY),
     )
 
     assert preview.status == HTTPStatus.OK
     assert "0918123424" in preview.text  # 名單裡的真號碼
     assert "陳筱琪" in preview.text  # 收件人姓名
-    assert "0900000000" not in preview.text  # 前端塞的假號碼被無視
     match = _TOKEN_PATTERN.search(preview.text)
     assert match is not None, "確認頁沒有 token，下拉模式的二階段確認壞了"
 
@@ -2827,3 +2902,898 @@ def test_send_trial_report_route_revalidates_days_even_if_frontend_disabled_was_
     # 稽核檔案要真的落地在我們指定的 tmp_path，而不是悄悄寫進 repo 的 logs/。
     audit_path = tmp_path / "trial-report-audit.jsonl"
     assert audit_path.exists()
+
+
+# --------------------------------------------------------------------------- #
+# 21. 兩處各寫一份的跳過原因字串，用測試釘在一起（同 _STATUS_TONE 那套作法）
+# --------------------------------------------------------------------------- #
+
+
+def test_skip_reason_labels_cover_every_batch_recipients_reason() -> None:
+    """`web.templates._SKIP_REASON_LABEL` 的 key 必須與
+    `web.batch_recipients.REASON_INVALID_FORMAT` / `REASON_DUPLICATE` 逐字一致
+    ——templates.py 執行期刻意不 import batch_recipients（會連帶 import mitake），
+    兩邊各寫一份字串，靠這支測試鎖住不漂移。
+    """
+    assert set(templates._SKIP_REASON_LABEL.keys()) == {
+        batch_recipients.REASON_INVALID_FORMAT,
+        batch_recipients.REASON_DUPLICATE,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# 22. 多人（上傳名單）模式：POST /preview
+# --------------------------------------------------------------------------- #
+
+
+def test_batch_preview_happy_path_issues_token_and_shows_counts(tmp_path: Path) -> None:
+    """正常名單（含一筆格式錯、一筆重複）→ 200，顯示正確的發送／跳過人數與總扣點。"""
+    app = make_app(tmp_path, RecordingSender())
+    text_content = "0912345678\n0987654321\nabc\n0912345678\n"
+
+    response = app.route(
+        "POST",
+        "/preview",
+        _batch_form(SHORT_BODY),
+        files={"recipients_file": text_content.encode("utf-8")},
+    )
+
+    assert response.status == HTTPStatus.OK
+    assert "2 人" in response.text  # 兩支有效號碼
+    assert "跳過的 2 筆" in response.text  # abc（格式錯）+ 重複的 0912345678
+    assert "2 人 × 1 則 = 2 點" in response.text
+    assert _TOKEN_PATTERN.search(response.text) is not None
+    assert app.token_store.pending_count == 1
+
+
+def test_batch_preview_missing_file_and_missing_text_is_400(tmp_path: Path) -> None:
+    """完全沒帶檔案也沒帶 recipients_text → 400，明講「請上傳名單檔案」。"""
+    sender = RecordingSender()
+    app = make_app(tmp_path, sender)
+
+    response = app.route("POST", "/preview", _batch_form(SHORT_BODY))
+
+    assert response.status == HTTPStatus.BAD_REQUEST
+    assert "請上傳名單檔案" in response.text
+    assert app.token_store.pending_count == 0
+    assert sender.call_count == 0
+
+
+def test_batch_preview_empty_uploaded_file_is_400(tmp_path: Path) -> None:
+    """上傳了一個 0 位元組的空檔案 → 與「沒上傳」同樣視為 400。"""
+    app = make_app(tmp_path, RecordingSender())
+
+    response = app.route(
+        "POST", "/preview", _batch_form(SHORT_BODY), files={"recipients_file": b""}
+    )
+
+    assert response.status == HTTPStatus.BAD_REQUEST
+    assert "請上傳名單檔案" in response.text
+
+
+def test_batch_preview_non_utf8_file_is_400(tmp_path: Path) -> None:
+    """檔案不是合法 UTF-8 → 400，訊息提示存成 UTF-8 純文字檔，不嘗試硬解。"""
+    app = make_app(tmp_path, RecordingSender())
+
+    response = app.route(
+        "POST",
+        "/preview",
+        _batch_form(SHORT_BODY),
+        files={"recipients_file": b"\xff\xfe\x00\x01"},
+    )
+
+    assert response.status == HTTPStatus.BAD_REQUEST
+    assert "編碼" in response.text
+
+
+def test_batch_preview_no_valid_numbers_is_400(tmp_path: Path) -> None:
+    """整份檔案沒有一支有效號碼（例如誤傳帶標題列的 Excel 匯出檔）→ 400。"""
+    app = make_app(tmp_path, RecordingSender())
+    text_content = "姓名,電話\n陳先生,0912345678\n"
+
+    response = app.route(
+        "POST",
+        "/preview",
+        _batch_form(SHORT_BODY),
+        files={"recipients_file": text_content.encode("utf-8")},
+    )
+
+    assert response.status == HTTPStatus.BAD_REQUEST
+    assert "沒有可發送的有效號碼" in response.text
+    assert app.token_store.pending_count == 0
+
+
+def test_batch_preview_over_max_batch_recipients_is_400(tmp_path: Path) -> None:
+    """有效號碼數超過 MAX_BATCH_RECIPIENTS → 400，要求分批上傳。"""
+    app = make_app(tmp_path, RecordingSender())
+    lines = [f"09{str(i).zfill(8)}" for i in range(batch_recipients.MAX_BATCH_RECIPIENTS + 1)]
+    text_content = "\n".join(lines)
+
+    response = app.route(
+        "POST",
+        "/preview",
+        _batch_form(SHORT_BODY),
+        files={"recipients_file": text_content.encode("utf-8")},
+    )
+
+    assert response.status == HTTPStatus.BAD_REQUEST
+    assert "不可超過" in response.text
+    assert app.token_store.pending_count == 0
+
+
+def test_batch_preview_exactly_at_max_batch_recipients_is_allowed(tmp_path: Path) -> None:
+    """筆數剛好等於上限 → 允許（``<=`` 而非 ``<``，沿用 RateLimiter 同樣的語意）。"""
+    app = make_app(tmp_path, RecordingSender(), rate_limit=10_000)
+    lines = [f"09{str(i).zfill(8)}" for i in range(batch_recipients.MAX_BATCH_RECIPIENTS)]
+    text_content = "\n".join(lines)
+
+    response = app.route(
+        "POST",
+        "/preview",
+        _batch_form(SHORT_BODY),
+        files={"recipients_file": text_content.encode("utf-8")},
+    )
+
+    assert response.status == HTTPStatus.OK
+    assert _TOKEN_PATTERN.search(response.text) is not None
+
+
+def test_batch_preview_accepts_non_txt_filename_with_valid_plain_text_content(
+    tmp_path: Path,
+) -> None:
+    """檔名是 ``.xlsx``（甚至完全沒有副檔名）但內容其實是合法的純文字號碼清單
+    → 一樣正常解析、放行，不因副檔名不符而擋下。
+
+    doc/spec-multi-recipient-sms.md 邊界條件明講：「副檔名檢查只是前端提示…
+    伺服器端實際判斷依內容能否以 UTF-8 解碼、且解析出至少一個有效號碼，副檔名
+    不符但內容剛好是純文字號碼清單時允許通過（不然使用者把檔名打錯就整個卡
+    住，且副檔名本來就是前端可偽造的東西，不該當成安全邊界）」。
+
+    刻意走真的 HTTP multipart 解析（而非直接呼叫 ``app.route(files=...)``）：
+    ``route()`` 的 ``files`` 參數本來就只是 ``dict[str, bytes]``，從來不帶檔名——
+    真正能證明「檔名被忽略」的地方，是 multipart 請求裡確實帶著一個非 ``.txt``
+    的 ``filename`` 參數，仍然被正常解析。``web.multipart.parse_multipart_form_data``
+    本來就只把 ``filename`` 有無當成「這是檔案欄位還是文字欄位」的判斷依據
+    （見 web/multipart.py），從未把檔名值往下傳給 ``web.batch_recipients`` 或
+    ``web.server``——這條測試把這個既有的架構事實，變成一條會失敗的回歸測試。
+    """
+    sender = RecordingSender()
+    app = make_app(tmp_path, sender)
+    server = create_server(app, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address[0], server.server_address[1]
+        boundary = "----NonTxtFilenameBoundary"
+        body = (
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="send-mode"\r\n\r\nbatch\r\n'
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="body"\r\n\r\n{SHORT_BODY}\r\n'
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="recipients_file"; '
+            'filename="list.xlsx"\r\nContent-Type: '
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet\r\n\r\n"
+            "0912345678\r\n0987654321\r\n"
+            f"--{boundary}--\r\n"
+        ).encode("utf-8")
+        request = urllib.request.Request(
+            f"http://{host}:{port}/preview",
+            data=body,
+            method="POST",
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            status = response.status
+            html = response.read().decode("utf-8")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status == 200
+    assert "確認批次發送內容" in html
+    assert "2 人" in html
+    assert sender.call_count == 0  # 這裡只是確認頁，還沒送出，不該有任何發送呼叫
+
+
+def test_batch_preview_empty_body_is_400(tmp_path: Path) -> None:
+    app = make_app(tmp_path, RecordingSender())
+
+    response = app.route(
+        "POST",
+        "/preview",
+        _batch_form("   "),
+        files={"recipients_file": b"0912345678\n"},
+    )
+
+    assert response.status == HTTPStatus.BAD_REQUEST
+    assert "不可為空白" in response.text
+
+
+def test_batch_preview_over_segment_limit_is_400(tmp_path: Path) -> None:
+    """每人內容超過單次則數上限 → 400（成本護欄，個人／多人模式共用同一條規則）。"""
+    app = make_app(tmp_path, RecordingSender())
+    too_long = "字" * (mitake.CHARS_PER_SEGMENT * mitake.MAX_SEGMENTS_PER_SEND + 1)
+
+    response = app.route(
+        "POST",
+        "/preview",
+        _batch_form(too_long),
+        files={"recipients_file": b"0912345678\n"},
+    )
+
+    assert response.status == HTTPStatus.BAD_REQUEST
+    assert "超過單次上限" in response.text
+
+
+def test_batch_preview_rate_limit_exceeded_is_429(tmp_path: Path) -> None:
+    """N 人 × M 則超過本小時上限 → 429，訊息講清楚是「N 人 × M 則」而非只講單一數字。"""
+    app = make_app(tmp_path, RecordingSender(), rate_limit=1)
+    text_content = "0912345678\n0987654321\n"  # 2 人 × 1 則 = 2 則，超過上限 1 則
+
+    response = app.route(
+        "POST",
+        "/preview",
+        _batch_form(SHORT_BODY),
+        files={"recipients_file": text_content.encode("utf-8")},
+    )
+
+    assert response.status == HTTPStatus.TOO_MANY_REQUESTS
+    assert "超過本小時上限" in response.text
+    assert "2 人" in response.text
+    assert app.token_store.pending_count == 0
+
+
+def test_batch_preview_rate_limit_exactly_at_boundary_is_allowed(tmp_path: Path) -> None:
+    """N 人 × M 則**剛好等於**本小時上限 → 允許（``<=`` 而非 ``<``）。
+
+    這裡鎖的是 ``RateLimiter`` 每小時速率上限本身的邊界，與上面
+    ``test_batch_preview_exactly_at_max_batch_recipients_is_allowed`` 驗證的
+    ``batch_recipients.MAX_BATCH_RECIPIENTS``（單次名單筆數的合理性上限）是
+    **兩個不同的常數、兩個不同的檢查點**：前者是 ``RateLimiter._check_locked``
+    （``self._rate.check(total_cost)``），後者是 ``_handle_preview_batch`` 裡
+    對 ``len(parsed.valid_phones)`` 的直接比較，兩者不可互相取代驗證。
+
+    沿用 ``RateLimiter._check_locked`` 既有語意（``used + cost <= self._limit``
+    才放行），與個人模式 ``/preview`` 的既有邊界測試同一套判斷準則。
+    """
+    app = make_app(tmp_path, RecordingSender(), rate_limit=5)
+    # 5 人 × 1 則（SHORT_BODY 只有 7 字，遠低於 CHARS_PER_SEGMENT）＝ 5 則，
+    # 剛好打平 rate_limit=5，不多不少。
+    text_content = "\n".join(f"09{str(i).zfill(8)}" for i in range(5))
+
+    response = app.route(
+        "POST",
+        "/preview",
+        _batch_form(SHORT_BODY),
+        files={"recipients_file": text_content.encode("utf-8")},
+    )
+
+    assert response.status == HTTPStatus.OK
+    assert "5 人" in response.text
+    assert "5 人 × 1 則 = 5 點" in response.text
+    assert _TOKEN_PATTERN.search(response.text) is not None
+    assert app.token_store.pending_count == 1
+
+
+def test_batch_preview_shows_skipped_reasons_in_chinese(tmp_path: Path) -> None:
+    app = make_app(tmp_path, RecordingSender())
+    text_content = "0912345678\nabc\n0912345678\n"
+
+    response = app.route(
+        "POST",
+        "/preview",
+        _batch_form(SHORT_BODY),
+        files={"recipients_file": text_content.encode("utf-8")},
+    )
+
+    assert response.status == HTTPStatus.OK
+    assert "格式錯誤" in response.text
+    assert "重複" in response.text
+
+
+def test_batch_preview_accepts_recipients_text_field_when_no_file_uploaded(
+    tmp_path: Path,
+) -> None:
+    """沒有上傳檔案時改讀 ``recipients_text``（重送流程用的欄位）——走完全相同的解析。"""
+    app = make_app(tmp_path, RecordingSender())
+
+    response = app.route(
+        "POST",
+        "/preview",
+        _batch_form(SHORT_BODY, recipients_text="0912345678\n0987654321"),
+    )
+
+    assert response.status == HTTPStatus.OK
+    assert "2 人" in response.text
+    assert _TOKEN_PATTERN.search(response.text) is not None
+
+
+def test_preview_without_send_mode_field_defaults_to_single_mode(tmp_path: Path) -> None:
+    """完全沒有 ``send-mode`` 欄位（例如舊版快取頁）→ 一律視為個人模式，不受批次邏輯影響。"""
+    sender = RecordingSender()
+    app = make_app(tmp_path, sender)
+
+    response = app.route("POST", "/preview", _form(phone=VALID_PHONE, body=SHORT_BODY))
+
+    assert response.status == HTTPStatus.OK
+    assert _TOKEN_PATTERN.search(response.text) is not None
+
+
+# --------------------------------------------------------------------------- #
+# 23. 多人（上傳名單）模式：POST /send
+# --------------------------------------------------------------------------- #
+
+
+def _issue_batch_token(
+    app: SmsWebApp, phones_text: str, body: str = SHORT_BODY
+) -> str:
+    """走一次多人模式 `/preview` 拿到批次確認頁的一次性 token。"""
+    response = app.route(
+        "POST",
+        "/preview",
+        _batch_form(body),
+        files={"recipients_file": phones_text.encode("utf-8")},
+    )
+    assert response.status == HTTPStatus.OK, response.text
+    match = _TOKEN_PATTERN.search(response.text)
+    assert match is not None, "批次確認頁沒有 token，二階段確認已經壞了"
+    return match.group(1)
+
+
+def test_batch_send_all_success(tmp_path: Path) -> None:
+    sender = SequencedSender(
+        [
+            {"msgid": "0313887539", "statuscode": "1", "account_point": 12572},
+            {"msgid": "0313887540", "statuscode": "1", "account_point": 12571},
+        ]
+    )
+    app = make_app(tmp_path, sender, rate_limit=10)
+    token = _issue_batch_token(app, "0912345678\n0987654321\n")
+
+    response = app.route("POST", "/send", _form(token=token))
+
+    assert response.status == HTTPStatus.OK
+    assert "已送達三竹 2 筆" in response.text
+    assert "未扣點失敗" not in response.text
+    assert "未確認" not in response.text
+    assert sender.call_count == 2
+    assert app.rate_limiter.snapshot().used == 2  # 兩筆都成功，全部計費，不退還
+
+
+def test_batch_send_mixed_not_charged_and_sent_refunds_only_that_part(
+    tmp_path: Path,
+) -> None:
+    sender = SequencedSender(
+        [
+            {"msgid": "0313887539", "statuscode": "1", "account_point": 12572},
+            api_error(possibly_charged=False, kind=mitake.KIND_API),
+        ]
+    )
+    app = make_app(tmp_path, sender, rate_limit=10)
+    token = _issue_batch_token(app, "0912345678\n0987654321\n")
+
+    response = app.route("POST", "/send", _form(token=token))
+
+    assert response.status == HTTPStatus.OK
+    assert "已送達三竹 1 筆" in response.text
+    assert "未扣點失敗 1 筆" in response.text
+    assert "未確認" not in response.text
+    # 總預約 2 則，1 筆確定沒扣點 → 只退 1 則，最終計費 1 則。
+    assert app.rate_limiter.snapshot().used == 1
+
+
+def test_batch_send_mixed_unconfirmed_and_sent_does_not_refund(tmp_path: Path) -> None:
+    sender = SequencedSender(
+        [
+            {"msgid": "0313887539", "statuscode": "1", "account_point": 12572},
+            api_error(possibly_charged=True, kind=mitake.KIND_UNCONFIRMED),
+        ]
+    )
+    app = make_app(tmp_path, sender, rate_limit=10)
+    token = _issue_batch_token(app, "0912345678\n0987654321\n")
+
+    response = app.route("POST", "/send", _form(token=token))
+
+    assert response.status == HTTPStatus.OK
+    assert "已送達三竹 1 筆" in response.text
+    assert "未確認 1 筆" in response.text
+    assert "未扣點失敗" not in response.text
+    # 未確認的那一筆視為已消耗，不退還——與已送達的那一筆合計仍是 2 則。
+    assert app.rate_limiter.snapshot().used == 2
+
+
+def test_batch_send_all_three_groups_mixed(tmp_path: Path) -> None:
+    sender = SequencedSender(
+        [
+            {"msgid": "0313887539", "statuscode": "1", "account_point": 12572},
+            api_error(possibly_charged=False, kind=mitake.KIND_API),
+            api_error(possibly_charged=True, kind=mitake.KIND_UNCONFIRMED),
+        ]
+    )
+    app = make_app(tmp_path, sender, rate_limit=10)
+    token = _issue_batch_token(app, "0912345678\n0987654321\n0955555555\n")
+
+    response = app.route("POST", "/send", _form(token=token))
+
+    assert response.status == HTTPStatus.OK
+    assert "已送達三竹 1 筆" in response.text
+    assert "未扣點失敗 1 筆" in response.text
+    assert "未確認 1 筆" in response.text
+    # 總預約 3 則，只退還「未扣點失敗」那 1 筆 → 最終計費 2 則。
+    assert app.rate_limiter.snapshot().used == 2
+    assert sender.call_count == 3
+
+
+def _counting_id_factory() -> "Callable[[], str]":
+    """回傳一個每呼叫一次就遞增的 id 產生器，給需要驗證「id 各自獨立」的測試用。
+
+    預設的 ``make_app`` 固定回傳字串 ``"req-test"``（既有測試依賴這個固定值），
+    無法用來驗證「同一批次每一筆的 request_id 互不相同」，所以另外準備一個。
+    """
+    counter = {"n": 0}
+
+    def factory() -> str:
+        counter["n"] += 1
+        return f"id-{counter['n']}"
+
+    return factory
+
+
+def test_batch_send_writes_shared_batch_id_to_audit(tmp_path: Path) -> None:
+    """同一批次的每一筆稽核紀錄要共用同一個 batch_id，讓事後能把它們串起來；
+    但每一筆的 request_id 仍各自獨立（沿用既有單筆稽核慣例）。
+    """
+    audit_path = tmp_path / "send-audit.jsonl"
+    sender = SequencedSender(
+        [
+            {"msgid": "0313887539", "statuscode": "1", "account_point": 12572},
+            {"msgid": "0313887540", "statuscode": "1", "account_point": 12571},
+        ]
+    )
+    app = make_app(
+        tmp_path,
+        sender,
+        audit_log=AuditLog(audit_path, fsync=False),
+        rate_limit=10,
+        request_id_factory=_counting_id_factory(),
+    )
+    token = _issue_batch_token(app, "0912345678\n0987654321\n")
+
+    app.route("POST", "/send", _form(token=token))
+
+    records = [json.loads(line) for line in audit_path.read_text(encoding="utf-8").splitlines()]
+    result_records = [r for r in records if r["event"] == "result"]
+    assert len(result_records) == 2
+    batch_ids = {r["batch_id"] for r in result_records}
+    assert len(batch_ids) == 1  # 同一批只有一個 batch_id
+    assert None not in batch_ids
+    # 每筆 request_id 仍各自獨立（不是共用同一個），沿用既有單筆稽核慣例。
+    request_ids = {r["request_id"] for r in result_records}
+    assert len(request_ids) == 2
+
+
+def test_batch_send_single_mode_audit_has_no_batch_id(tmp_path: Path) -> None:
+    """單筆發送的稽核紀錄 batch_id 一律是 None——確保這次擴充不影響既有單筆行為。"""
+    audit_path = tmp_path / "send-audit.jsonl"
+    sender = RecordingSender()
+    app = make_app(tmp_path, sender, audit_log=AuditLog(audit_path, fsync=False))
+
+    send_once(app)
+
+    records = [json.loads(line) for line in audit_path.read_text(encoding="utf-8").splitlines()]
+    result_records = [r for r in records if r["event"] == "result"]
+    assert len(result_records) == 1
+    assert result_records[0]["batch_id"] is None
+
+
+def test_batch_send_shows_audit_failure_warning_with_masked_phones_and_msgid(
+    tmp_path: Path,
+) -> None:
+    """稽核寫入全部失敗時，批次結果頁要顯示醒目警示，列出正確的遮罩號碼與 msgid。
+
+    這是 code-reviewer MUST_FIX 1 的回歸鎖：批次模式先前完全沒有沿用單人模式
+    對 ``audit_ok`` 的追蹤（見 ``_succeed`` / ``_fail_unconfirmed``），磁碟滿或
+    稽核檔路徑不可寫時，畫面會顯示一片乾淨的「已送達」，操作者完全不會被提醒
+    這批可能沒留底。用 ``FailingAuditLog``（既有測試替身，`record()` 一律回
+    ``False``）模擬全部寫入失敗。
+    """
+    sender = SequencedSender(
+        [
+            {"msgid": "0313887539", "statuscode": "1", "account_point": 12572},
+            api_error(possibly_charged=False, kind=mitake.KIND_API),
+        ]
+    )
+    app = make_app(
+        tmp_path,
+        sender,
+        audit_log=FailingAuditLog(tmp_path / "send-audit.jsonl"),
+        rate_limit=10,
+    )
+    token = _issue_batch_token(app, "0912345678\n0987654321\n")
+
+    response = app.route("POST", "/send", _form(token=token))
+
+    assert response.status == HTTPStatus.OK
+    assert "稽核紀錄寫入失敗" in response.text
+    assert "請立刻手動記下" in response.text
+    assert "0313887539" in response.text  # 已送達那筆的 msgid 要出現在警示框裡
+    assert "0912***78" in response.text  # 已送達那筆的遮罩號碼（0912345678）
+    assert "0987***21" in response.text  # 未扣點失敗那筆的遮罩號碼（0987654321）
+    # 仍然照常分成三組顯示——audit 失敗不該連帶影響原本的成敗分類邏輯。
+    assert "已送達三竹 1 筆" in response.text
+    assert "未扣點失敗 1 筆" in response.text
+
+
+def test_batch_send_audit_ok_writes_no_warning_box(tmp_path: Path) -> None:
+    """稽核全部寫入成功時，**不該**出現稽核警示框——避免誤報嚇壞操作者。"""
+    sender = SequencedSender(
+        [{"msgid": "0313887539", "statuscode": "1", "account_point": 12572}]
+    )
+    app = make_app(tmp_path, sender, rate_limit=10)
+    token = _issue_batch_token(app, "0912345678\n")
+
+    response = app.route("POST", "/send", _form(token=token))
+
+    assert response.status == HTTPStatus.OK
+    assert "稽核紀錄寫入失敗" not in response.text
+
+
+def test_batch_send_ip_blocked_and_auth_failed_offer_no_resend(tmp_path: Path) -> None:
+    """設定類錯誤（IP 白名單／帳密錯）不提供重送——重送一百次也一樣失敗，
+    不該誘人對著整份名單白按。"""
+    sender = SequencedSender(
+        [
+            api_error(possibly_charged=False, kind=mitake.KIND_IP_BLOCKED),
+            api_error(possibly_charged=False, kind=mitake.KIND_AUTH_FAILED),
+        ]
+    )
+    app = make_app(tmp_path, sender, rate_limit=10)
+    token = _issue_batch_token(app, "0912345678\n0987654321\n")
+
+    response = app.route("POST", "/send", _form(token=token))
+
+    assert response.status == HTTPStatus.OK
+    assert "未扣點失敗 2 筆" in response.text
+    assert "重送不會成功" in response.text
+    assert "<form" not in response.text  # 沒有任何一筆可重送，不該出現重送表單
+    assert "0912***78" in response.text
+    assert "0987***21" in response.text
+
+
+def test_batch_send_not_charged_group_offers_resend_via_preview_only(
+    tmp_path: Path,
+) -> None:
+    """「未扣點失敗」組要有重送入口，但重送一律導回 /preview（不是直接花錢的按鈕）。"""
+    sender = SequencedSender([api_error(possibly_charged=False, kind=mitake.KIND_API)])
+    app = make_app(tmp_path, sender, rate_limit=10)
+    token = _issue_batch_token(app, "0912345678\n")
+
+    response = app.route("POST", "/send", _form(token=token))
+
+    assert response.status == HTTPStatus.OK
+    assert "<form" in response.text
+    assert 'action="/preview"' in response.text
+    assert 'name="send-mode" value="batch"' in response.text
+    assert "0912345678" in response.text  # 重送表單帶著要重送的那支號碼
+
+
+def test_batch_send_unconfirmed_only_group_has_absolutely_no_form(tmp_path: Path) -> None:
+    """整批全部落在「未確認」時，這頁**不得有任何 `<form>`**——最容易改壞的鐵律。"""
+    sender = SequencedSender(
+        [
+            api_error(possibly_charged=True, kind=mitake.KIND_UNCONFIRMED),
+            api_error(possibly_charged=True, kind=mitake.KIND_UNCONFIRMED),
+        ]
+    )
+    app = make_app(tmp_path, sender, rate_limit=10)
+    token = _issue_batch_token(app, "0912345678\n0987654321\n")
+
+    response = app.route("POST", "/send", _form(token=token))
+
+    assert response.status == HTTPStatus.OK
+    assert "<form" not in response.text
+    assert "請勿對這幾筆重送" in response.text
+
+
+def test_batch_send_rate_limit_exceeded_at_send_time(tmp_path: Path) -> None:
+    """token 發出後、真正送出前額度被佔走 → /send 回 429，且完全不呼叫 sender。"""
+    sender = SequencedSender(
+        [
+            {"msgid": "0313887539", "statuscode": "1", "account_point": 12572},
+            {"msgid": "0313887540", "statuscode": "1", "account_point": 12571},
+        ]
+    )
+    app = make_app(tmp_path, sender, rate_limit=3)
+    token = _issue_batch_token(app, "0912345678\n0987654321\n")  # 總成本 2 則
+
+    # 模擬「token 發出後，額度被別的請求先佔走」。
+    app.rate_limiter.reserve(2)
+
+    response = app.route("POST", "/send", _form(token=token))
+
+    assert response.status == HTTPStatus.TOO_MANY_REQUESTS
+    assert sender.call_count == 0
+
+
+# --------------------------------------------------------------------------- #
+# 24. 端對端：真的走 HTTP 層的 multipart 解析（不是只餵 route(files=...)）
+# --------------------------------------------------------------------------- #
+
+
+def test_live_server_accepts_multipart_batch_upload_end_to_end(tmp_path: Path) -> None:
+    """真的用 socket 送一個 multipart POST，驗證 Content-Type 分派＋
+    `web.multipart` 解析真的接到 `SmsWebApp.route()`——上面所有批次測試都直接
+    呼叫 `app.route(..., files=...)`，繞過了 HTTP 層那一段。
+    """
+    sender = RecordingSender()
+    app = make_app(tmp_path, sender)
+    server = create_server(app, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address[0], server.server_address[1]
+        boundary = "----LiveTestBoundary"
+        body = (
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="send-mode"\r\n\r\nbatch\r\n'
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="body"\r\n\r\n{SHORT_BODY}\r\n'
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="recipients_file"; '
+            'filename="list.txt"\r\nContent-Type: text/plain\r\n\r\n'
+            "0912345678\r\n"
+            f"--{boundary}--\r\n"
+        ).encode("utf-8")
+        request = urllib.request.Request(
+            f"http://{host}:{port}/preview",
+            data=body,
+            method="POST",
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            status = response.status
+            html = response.read().decode("utf-8")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status == 200
+    assert "確認批次發送內容" in html
+
+
+def test_multipart_body_over_limit_is_rejected_before_parsing(tmp_path: Path) -> None:
+    """multipart body 超過 MAX_MULTIPART_BODY_BYTES → 413，不解析、不進 route()。
+
+    刻意**不**走真的 socket（同類的既有 ``MAX_REQUEST_BODY_BYTES`` 也沒有走真的
+    socket 測）：對一個 ~125KB 的請求本文，用真實 HTTP 用戶端送出時，伺服器在
+    讀完 Content-Length 位元組**之前**就先回應 413 並依 HTTP/1.0 慣例關閉連線，
+    用戶端仍在寫入本文的那個系統呼叫可能因此提早失敗（``BrokenPipeError`` /
+    ``ConnectionResetError``），使測試結果隨作業系統的 TCP 緩衝區大小而不穩定
+    ——這與本測試想驗證的行為（位元組上限本身有沒有生效）無關。改成直接呼叫
+    handler 層的 :meth:`_read_request_body`，用一個假的 ``rfile`` 餵資料，同樣能
+    驗證「超過上限就 413、且完全不呼叫 ``web.multipart.parse_multipart_form_data``」
+    ，且不受這個 race 影響。
+    """
+    import io
+
+    handler_class = make_handler(make_app(tmp_path, RecordingSender()))
+    handler = handler_class.__new__(handler_class)  # 繞過 socket 相關的 __init__
+    boundary = "----OversizeBoundary"
+    oversized_content = b"0" * (MAX_MULTIPART_BODY_BYTES + 1024)
+    body = (
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="recipients_file"; '
+        'filename="big.txt"\r\nContent-Type: text/plain\r\n\r\n'
+    ).encode("utf-8") + oversized_content + f"\r\n--{boundary}--\r\n".encode("utf-8")
+
+    class _FakeHeaders:
+        def __init__(self, values: dict[str, str]) -> None:
+            self._values = values
+
+        def get(self, name: str) -> str | None:
+            return self._values.get(name)
+
+    handler.headers = _FakeHeaders(
+        {
+            "Content-Length": str(len(body)),
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+        }
+    )
+    handler.rfile = io.BytesIO(body)
+
+    from web.server import _RequestError
+
+    with pytest.raises(_RequestError) as exc_info:
+        handler._read_request_body()
+
+    assert exc_info.value.status == HTTPStatus.REQUEST_ENTITY_TOO_LARGE
+
+
+def test_live_server_accepts_multipart_batch_at_max_recipients_boundary(
+    tmp_path: Path,
+) -> None:
+    """名單筆數剛好等於 ``batch_recipients.MAX_BATCH_RECIPIENTS``（500 筆）時，
+    真的走 HTTP multipart 請求也要放行——不會被 ``MAX_MULTIPART_BODY_BYTES``
+    這個位元組上限卡住（500 支 10 碼號碼＋換行遠小於 ``MAX_MULTIPART_BODY_BYTES``
+    的 125KB）。既有的
+    ``test_batch_preview_exactly_at_max_batch_recipients_is_allowed`` 只走
+    ``app.route(files=...)``，跳過了真實 ``Content-Length`` 比對那一層，
+    這條補上真的 socket 版本。
+    """
+    app = make_app(tmp_path, RecordingSender(), rate_limit=10_000)
+    server = create_server(app, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address[0], server.server_address[1]
+        boundary = "----MaxRecipientsBoundary"
+        phones_text = "\n".join(
+            f"09{str(i).zfill(8)}" for i in range(batch_recipients.MAX_BATCH_RECIPIENTS)
+        )
+        body = (
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="send-mode"\r\n\r\nbatch\r\n'
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="body"\r\n\r\n{SHORT_BODY}\r\n'
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="recipients_file"; '
+            'filename="list.txt"\r\nContent-Type: text/plain\r\n\r\n'
+            f"{phones_text}\r\n"
+            f"--{boundary}--\r\n"
+        ).encode("utf-8")
+        assert len(body) < MAX_MULTIPART_BODY_BYTES, (
+            "測試前提：這份 500 筆名單的 multipart body 本來就該遠小於上限，"
+            "否則這條測試驗證的就不是「筆數上限」而是「位元組上限」了。"
+        )
+        request = urllib.request.Request(
+            f"http://{host}:{port}/preview",
+            data=body,
+            method="POST",
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            status = response.status
+            html = response.read().decode("utf-8")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status == 200
+    assert "確認批次發送內容" in html
+    assert f"{batch_recipients.MAX_BATCH_RECIPIENTS} 人" in html
+
+
+# --------------------------------------------------------------------------- #
+# 25. HTTP 層：application/x-www-form-urlencoded 這條路徑（個人模式的既有格式）
+#     ——本檔對 multipart 已有端對端＋白箱兩層驗證，但 urlencoded 這條在本次
+#     擴充之前完全沒有走過真正 HTTP 層 `_read_request_body` 的自動化測試：
+#     既有 100 多個測試全部直接呼叫 `app.route()` 餵現成的 dict，繞過了
+#     `Content-Type` 判斷／`MAX_REQUEST_BODY_BYTES` 檢查那一層。
+# --------------------------------------------------------------------------- #
+
+
+def test_live_server_accepts_urlencoded_post_end_to_end(tmp_path: Path) -> None:
+    """真的用 socket 送一個 ``application/x-www-form-urlencoded`` 的 POST，
+    驗證 ``_read_request_body`` 的 urlencoded 分支仍然正常運作（個人模式的
+    既有格式，本次擴充只是在它旁邊多加一個 multipart 分支，不該改到它）。
+
+    這是本專案「花錢端點」對 urlencoded 這條路徑**唯一**一條走真正 HTTP 層的
+    測試——其餘所有既有測試都直接呼叫 ``app.route()`` 餵現成的 dict，完全繞過
+    ``Content-Type`` 判斷本身。
+    """
+    sender = RecordingSender()
+    app = make_app(tmp_path, sender)
+    server = create_server(app, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address[0], server.server_address[1]
+        from urllib.parse import urlencode
+
+        body = urlencode({"phone": VALID_PHONE, "body": SHORT_BODY}).encode("ascii")
+        request = urllib.request.Request(
+            f"http://{host}:{port}/preview",
+            data=body,
+            method="POST",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            status = response.status
+            html = response.read().decode("utf-8")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status == 200
+    assert "確認發送內容" in html
+    assert VALID_PHONE in html
+
+
+def test_urlencoded_body_over_max_request_body_bytes_is_rejected(tmp_path: Path) -> None:
+    """``application/x-www-form-urlencoded`` 超過既有 ``MAX_REQUEST_BODY_BYTES``
+    上限 → 413，不放寬（這是個人模式原本就有的上限，本次新增
+    ``MAX_MULTIPART_BODY_BYTES`` 不該影響到它）。
+
+    與 ``test_multipart_body_over_limit_is_rejected_before_parsing`` 同一種白箱
+    手法（同一個理由：真的 socket 送超大 body 有 client 寫入與 server 提早關閉
+    連線的 race，見該測試 docstring），直接呼叫 handler 層的
+    :meth:`_read_request_body`，用假的 ``rfile`` 餵超過上限的資料。
+    """
+    import io
+
+    from web.server import MAX_REQUEST_BODY_BYTES, _RequestError
+
+    handler_class = make_handler(make_app(tmp_path, RecordingSender()))
+    handler = handler_class.__new__(handler_class)  # 繞過 socket 相關的 __init__
+    oversized_body = b"body=" + b"x" * (MAX_REQUEST_BODY_BYTES + 1024)
+
+    class _FakeHeaders:
+        def __init__(self, values: dict[str, str]) -> None:
+            self._values = values
+
+        def get(self, name: str) -> str | None:
+            return self._values.get(name)
+
+    handler.headers = _FakeHeaders(
+        {
+            "Content-Length": str(len(oversized_body)),
+            "Content-Type": "application/x-www-form-urlencoded",
+        }
+    )
+    handler.rfile = io.BytesIO(oversized_body)
+
+    with pytest.raises(_RequestError) as exc_info:
+        handler._read_request_body()
+
+    assert exc_info.value.status == HTTPStatus.REQUEST_ENTITY_TOO_LARGE
+
+
+def test_urlencoded_body_within_limit_but_over_multipart_limit_still_accepted(
+    tmp_path: Path,
+) -> None:
+    """urlencoded 的位元組上限判斷用的是 ``MAX_REQUEST_BODY_BYTES``（較小），
+    不是本次新增、給 multipart 用的 ``MAX_MULTIPART_BODY_BYTES``（較大）——
+    兩個上限完全獨立，不可混用同一個常數判斷。這裡構造一個大小介於兩者之間
+    的 urlencoded body（超過 ``MAX_REQUEST_BODY_BYTES`` 但小於
+    ``MAX_MULTIPART_BODY_BYTES``），驗證它依然被 urlencoded 分支的既有上限擋下
+    （不會誤用比較寬鬆的 multipart 上限放行）。
+    """
+    import io
+
+    from web.server import MAX_REQUEST_BODY_BYTES, _RequestError
+
+    assert MAX_REQUEST_BODY_BYTES < MAX_MULTIPART_BODY_BYTES, (
+        "本測試的前提：兩個上限不同且 urlencoded 的比較小，"
+        "如果哪天改成一樣大，這條測試需要重新設計。"
+    )
+
+    handler_class = make_handler(make_app(tmp_path, RecordingSender()))
+    handler = handler_class.__new__(handler_class)
+    mid_sized_body = b"body=" + b"x" * (
+        MAX_REQUEST_BODY_BYTES + (MAX_MULTIPART_BODY_BYTES - MAX_REQUEST_BODY_BYTES) // 2
+    )
+
+    class _FakeHeaders:
+        def __init__(self, values: dict[str, str]) -> None:
+            self._values = values
+
+        def get(self, name: str) -> str | None:
+            return self._values.get(name)
+
+    handler.headers = _FakeHeaders(
+        {
+            "Content-Length": str(len(mid_sized_body)),
+            "Content-Type": "application/x-www-form-urlencoded",
+        }
+    )
+    handler.rfile = io.BytesIO(mid_sized_body)
+
+    with pytest.raises(_RequestError) as exc_info:
+        handler._read_request_body()
+
+    assert exc_info.value.status == HTTPStatus.REQUEST_ENTITY_TOO_LARGE

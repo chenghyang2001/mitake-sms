@@ -31,6 +31,11 @@ if TYPE_CHECKING:
     # all()/selectable()/is_empty()/generated_at，不需要真的持有那個類別。
     from web.recipients import RecipientBook
 
+    # 同理：web.batch_recipients 會 import mitake（需要 mitake.validate_phone），
+    # 本檔執行期不 import 它，只用 duck typing 存取 SkippedRecipient 的
+    # raw_line / reason 兩個屬性（見 render_preview_batch）。
+    from web.batch_recipients import SkippedRecipient
+
 # 版本常數的唯一來源在 web/__init__.py。templates 是以 web.templates 被匯入的，
 # 匯入本模組時 web 套件的 __init__ 早已執行完，所以這裡讀 web.__version__ 是安全的
 # （不會踩到 web/__init__.py docstring 提到的「先 import 子模組」那條脆弱路徑）。
@@ -43,11 +48,13 @@ __all__ = [
     "REASON_NEVER_REACHED_MITAKE",
     "REASON_VALIDATION_BLOCKED",
     "STATUS_PATH",
+    "render_batch_result",
     "render_failed_safe",
     "render_failed_unconfirmed",
     "render_form",
     "render_notice",
     "render_preview",
+    "render_preview_batch",
     "render_sent",
     "render_status_form",
     "render_status_result",
@@ -174,6 +181,41 @@ MESSAGE_TEMPLATES = [
 ]
 
 
+# 跳過原因代碼 → 中文說明。值必須與 web.batch_recipients.REASON_INVALID_FORMAT /
+# REASON_DUPLICATE 逐字一致 —— 這裡刻意**不** import web.batch_recipients
+# （它會連帶 import mitake，違反本檔「執行期不碰 mitake」的既定原則，見
+# _STATUS_TONE 的註解），所以兩邊各寫一份字串，靠
+# tests/test_web.py::test_skip_reason_labels_cover_every_batch_recipients_reason
+# 把兩處釘在一起，改了一邊沒改另一邊會直接紅燈，不會靜默漂開。
+_SKIP_REASON_LABEL: dict[str, str] = {
+    "invalid_format": "格式錯誤，不是合法的手機號碼",
+    "duplicate": "與名單中前面某一行重複",
+}
+
+
+def _mode_switch_fieldset() -> str:
+    """「發送對象模式」單選（個人／多人）。
+
+    純前端切換要顯示哪個子區塊（見 :data:`_SEGMENT_SCRIPT` 尾段的
+    ``addEventListener``），伺服器端依表單裡 ``send-mode`` 欄位的值決定要走哪條
+    處理邏輯（見 ``web.server.SmsWebApp.handle_preview``）。**沒有這個欄位**
+    （例如舊版快取頁、既有測試直接呼叫 ``route()`` 卻沒帶這個欄位）一律視為
+    個人模式 —— 這是刻意的預設方向，確保新增本功能之前的既有行為完全不受影響。
+
+    沿用 ``.templates`` / ``.tmpl`` 既有 CSS 類別（見 :data:`_STYLE`），不新增
+    樣式規則：視覺上與訊息範本快選同一套「輕量卡片式 fieldset」語彙一致。
+    """
+    return (
+        '<fieldset class="templates">\n'
+        "<legend>發送對象</legend>\n"
+        '<label class="tmpl"><input type="radio" name="send-mode" value="single" '
+        'id="mode-single" checked> 個人</label>\n'
+        '<label class="tmpl"><input type="radio" name="send-mode" value="batch" '
+        'id="mode-batch"> 多人（上傳名單）</label>\n'
+        "</fieldset>\n"
+    )
+
+
 def _template_radios(templates: list[dict]) -> str:
     """訊息範本快選的一組單選 radio（fieldset）。
 
@@ -238,6 +280,24 @@ _SEGMENT_SCRIPT = """
     });
   });
   update();
+
+  // 發送對象模式切換（個人／多人）：純前端顯示切換，不影響送出邏輯 ——
+  // 實際走哪條處理邏輯由伺服器端讀表單裡的 send-mode 欄位決定（見
+  // web.server.SmsWebApp.handle_preview）。找不到對應的 DOM 元素就安靜跳過
+  // （表示這個頁面沒有多人模式子區塊，例如未來若有頁面重用同一顆腳本）。
+  var modeRadios = document.querySelectorAll('input[type=radio][name="send-mode"]');
+  var singleSection = document.getElementById("single-section");
+  var batchSection = document.getElementById("batch-section");
+  function updateMode() {
+    var checked = document.querySelector('input[name="send-mode"]:checked');
+    var isBatch = !!checked && checked.value === "batch";
+    if (singleSection) { singleSection.style.display = isBatch ? "none" : ""; }
+    if (batchSection) { batchSection.style.display = isBatch ? "" : "none"; }
+  }
+  Array.prototype.forEach.call(modeRadios, function (r) {
+    r.addEventListener("change", updateMode);
+  });
+  updateMode();
 })();
 """
 
@@ -351,6 +411,26 @@ def _hidden_resend_form(phone: str, body: str, label: str) -> str:
     )
 
 
+def _hidden_batch_resend_form(phones: list[str], body: str, label: str) -> str:
+    """批次「未扣點失敗」的重送按鈕：導回 ``/preview``（多人模式），而不是直接送出。
+
+    與 :func:`_hidden_resend_form` 同一條鐵律：重送**一定要重走確認頁**，
+    這裡把要重送的那幾支號碼以換行分隔塞進一個隱藏欄位 ``recipients_text``——
+    ``web.server.handle_preview`` 的多人模式分支接受這個欄位當成「檔案內容」的
+    替代來源（沒有上傳檔案時才讀它），走的是**完全相同**的解析／驗證／去重／
+    確認頁流程，不是另開一條「信任前端傳來的號碼清單」的捷徑。
+    """
+    phones_text = "\n".join(phones)
+    return (
+        '<form method="post" action="/preview">\n'
+        '<input type="hidden" name="send-mode" value="batch">\n'
+        f'<input type="hidden" name="recipients_text" value="{_e(phones_text)}">\n'
+        f'<input type="hidden" name="body" value="{_e(body)}">\n'
+        f"<button type=\"submit\">{_e(label)}</button>\n"
+        "</form>\n"
+    )
+
+
 def _mask_recipient_phone(phone: str | None) -> str:
     """遮罩顯示號碼：保留前 4、後 2，中間以 ``***`` 取代（例 ``0918123456`` → ``0918***56``）。
 
@@ -369,12 +449,20 @@ def _mask_recipient_phone(phone: str | None) -> str:
 
 
 def _recipient_field(book: "RecipientBook | None", phone: str) -> str:
-    """手機號碼欄位：有名單走下拉、沒名單維持手動輸入。
+    """手機號碼欄位：有名單走「下拉 + 並存的手動輸入」，沒名單維持純手動輸入。
 
     **這是整個功能「不破壞現況」的關鍵所在。** ``book`` 為 ``None`` 或空時，輸出與
-    改造前**逐字一致**的手動 ``<input name="phone">``（既有 114 個回歸測試全走這條，
-    一個字都不能動），只多一行「名單尚未同步」的說明。只有 book 非空時才改出
-    ``<select name="recipient_id">``。
+    改造前**逐字一致**的手動 ``<input name="phone">``（既有回歸測試全走這條，
+    一個字都不能動），只多一行「名單尚未同步」的說明。
+
+    只有 book 非空時才改出 ``<select name="recipient_id">``，**且**額外附上一個
+    「或手動輸入號碼」的 ``<input type="tel" name="phone">``（見
+    doc/spec-multi-recipient-sms.md §2）——兩者並存、擇一使用，伺服器端
+    （``web.server.handle_preview``）若偵測到兩者都有值會直接擋下、不猜優先序。
+    正因為手動輸入從此不再是「送出前必填」，``<select>`` 也**不再帶
+    ``required``**：加了 ``required`` 的話，使用者想改用手動輸入時，瀏覽器會
+    因為下拉還停在 disabled 的預設選項而擋下整張表單送出，反而讓「手動輸入」這個
+    選項形同虛設。
     """
     if book is None or book.is_empty():
         # 現況路徑：手動輸入。這段 HTML 必須與改造前完全相同。
@@ -401,15 +489,23 @@ def _recipient_field(book: "RecipientBook | None", phone: str) -> str:
             options.append(
                 f"<option disabled>{_e(rec.name)}（查無電話／多筆相符，不可選）</option>\n"
             )
-    # name="recipient_id" 放在最前面：伺服器端只認這個欄位，前端送來的 phone 一律忽略。
+    # name="recipient_id" 放在最前面：伺服器端只認這個欄位，前端送來的 phone 一律忽略
+    # ——除非兩者都有值，那時伺服器端會直接擋下（見上方 docstring）。
     field = (
         '<label for="sms-recipient">發送對象</label>\n'
-        '<select name="recipient_id" id="sms-recipient" required>\n'
+        '<select name="recipient_id" id="sms-recipient">\n'
         f"{''.join(options)}"
         "</select>\n"
     )
     if book.generated_at:
         field += f'<p class="muted">名單同步於 {_e(book.generated_at)}</p>\n'
+    field += (
+        '<label for="sms-phone-manual">或手動輸入號碼</label>\n'
+        '<input type="tel" id="sms-phone-manual" name="phone" autocomplete="off" '
+        'inputmode="numeric" placeholder="09xxxxxxxx" '
+        f'value="{_e(phone)}">\n'
+        '<p class="muted">下拉選單與手動輸入請只擇一；兩者都填會被擋下、不會送出。</p>\n'
+    )
     return field
 
 
@@ -495,11 +591,13 @@ def render_form(
     rate_used: int | None = None,
     rate_limit: int | None = None,
     recipients: "RecipientBook | None" = None,
+    max_batch_recipients: int = 500,
 ) -> str:
     """表單頁（``GET /``，以及各種被擋下時的回填頁）。
 
-    ``recipients`` 非空時，手機號碼欄位改成發送對象下拉選單（號碼在伺服器端反查）；
-    ``None`` 或空名單時維持手動輸入號碼 —— 這是預設，確保沒設定名單的既有行為不變。
+    ``recipients`` 非空時，個人模式的手機號碼欄位改成「下拉 + 並存的手動輸入」
+    （號碼在伺服器端反查）；``None`` 或空名單時維持純手動輸入號碼 —— 這是預設，
+    確保沒設定名單的既有行為不變。
 
     ``phone`` / ``body`` 是使用者上次填的內容 —— 被擋下時原樣回填，
     否則使用者得整段重打，而重打長訊息本身就是打錯字、送錯人的來源。
@@ -507,6 +605,13 @@ def render_form(
     ``script_nonce`` 沒有預設值，是刻意的：這是全站唯一帶 ``<script>`` 的頁面，
     而該 nonce 必須與同一個回應的 CSP 標頭一致（且每個回應都要換一組新的），
     所以只有產生回應的那一層能決定它，樣板不該自己編一個。
+
+    ``max_batch_recipients`` 只用來在畫面上提示「單次最多幾筆」，實際上限判斷在
+    伺服器端（``web.batch_recipients.MAX_BATCH_RECIPIENTS``）。預設值 500 只是
+    讓 :func:`render_form` 在沒有呼叫端明確傳入時（例如
+    ``test_render_form_refuses_script_without_nonce`` 這類只關心其他行為的既有
+    測試）仍能正常渲染；實際部署時 ``web.server.handle_index`` 一定會傳入真正的
+    常數值，兩處的值靠測試釘在一起（同 :data:`_SKIP_REASON_LABEL` 那套作法）。
     """
     parts = ["<h1>addwii 簡訊發送</h1>\n"]
     parts.append(
@@ -524,11 +629,31 @@ def render_form(
             f'<p class="muted">本小時已送出 {rate_used} / {rate_limit} 則。</p>\n'
         )
 
-    parts.append('<form method="post" action="/preview" accept-charset="UTF-8">\n')
-    # 手機號碼欄位：有名單走下拉、沒名單維持手動輸入（見 _recipient_field）。
+    # enctype 固定為 multipart/form-data：多人模式需要真的檔案上傳（見
+    # web/multipart.py），而個人模式與多人模式共用同一個 <form>（用 send-mode
+    # 欄位讓伺服器端分流，見 web.server.handle_preview）。multipart 一樣能正常
+    # 承載一般文字欄位，個人模式的既有行為不受影響。
+    parts.append(
+        '<form method="post" action="/preview" accept-charset="UTF-8" '
+        'enctype="multipart/form-data">\n'
+    )
+    parts.append(_mode_switch_fieldset())
+    parts.append('<div id="single-section">\n')
+    # 手機號碼欄位：有名單走「下拉 + 並存的手動輸入」、沒名單維持純手動輸入
+    # （見 _recipient_field）。
     parts.append(_recipient_field(recipients, phone))
+    parts.append("</div>\n")
+    parts.append(
+        '<div id="batch-section" style="display:none">\n'
+        '<label for="recipients-file">上傳名單檔案</label>\n'
+        '<input type="file" id="recipients-file" name="recipients_file" accept=".txt">\n'
+        '<p class="muted">純文字檔，每行一支手機號碼，檔案內不要有其他內容。'
+        f"單次最多 {int(max_batch_recipients)} 筆，超過請分批上傳。</p>\n"
+        "</div>\n"
+    )
     # 訊息範本快選：放在簡訊內容欄之上，選一個 radio 就把預設內容帶入下方 textarea
     # （帶入由 _SEGMENT_SCRIPT 掛 change 監聽處理）。純前端便利功能，不影響送出邏輯。
+    # 個人／多人兩種模式共用同一個 textarea（同一則內容發給所有人）。
     parts.append(_template_radios(MESSAGE_TEMPLATES))
     parts.append('<label for="sms-body">簡訊內容</label>\n')
     parts.append(
@@ -599,6 +724,218 @@ def render_preview(
     parts.append(_back_link("← 改一下再送"))
 
     return _page("確認發送內容", "".join(parts))
+
+
+def render_preview_batch(
+    *,
+    phones: list[str],
+    skipped: "list[SkippedRecipient]",
+    body: str,
+    segments: int,
+    chars: int,
+    token: str,
+) -> str:
+    """批次確認頁（多人模式 ``POST /preview`` 的回應）。按下這頁的按鈕才會真的花錢。
+
+    列出「將發送 N 人」（遮罩號碼、可摺疊）、「跳過 M 人」（遮罩原始行內容 + 原因、
+    可摺疊）、以及「共 N 人 × M 則 = 扣 N×M 點」的總扣點試算。與 :func:`render_preview`
+    同一條鐵律：表單裡**只帶 token**，不帶號碼清單本身 —— 完整清單留在伺服器端的
+    token 內容裡，前端拿不到也改不了這組號碼（見 doc/spec-multi-recipient-sms.md §4）。
+    """
+    total_recipients = len(phones)
+    total_cost = total_recipients * segments
+
+    parts = ["<h1>確認批次發送內容</h1>\n"]
+    parts.append(
+        _box(
+            "warn",
+            "按下送出就會依序發送給每一位，且無法取消",
+            "<p>請確認名單與內容無誤。三竹沒有「收回」功能，會依序逐筆發送，"
+            "中途無法暫停。</p>\n",
+        )
+    )
+    parts.append("<dl>\n")
+    parts.append(f"<dt>將發送</dt><dd><strong>{total_recipients} 人</strong></dd>\n")
+    parts.append(f"<dt>跳過</dt><dd>{len(skipped)} 人（原因見下方）</dd>\n")
+    parts.append(f"<dt>每人字數／則數</dt><dd>{chars} 字 ／ {segments} 則</dd>\n")
+    parts.append(
+        f"<dt>共將扣點數</dt><dd><strong>{total_recipients} 人 × {segments} 則 "
+        f"= {total_cost} 點</strong></dd>\n"
+    )
+    parts.append("</dl>\n")
+
+    if phones:
+        rows = "".join(f"<li>{_e(_mask_recipient_phone(p))}</li>\n" for p in phones)
+        parts.append(
+            f"<details>\n<summary>將發送的 {total_recipients} 支號碼（點開展開）</summary>\n"
+            f"<ul>\n{rows}</ul>\n</details>\n"
+        )
+    if skipped:
+        skip_rows = "".join(
+            f"<li>{_e(_mask_recipient_phone(item.raw_line))}"
+            f"（{_e(_SKIP_REASON_LABEL.get(item.reason, item.reason))}）</li>\n"
+            for item in skipped
+        )
+        parts.append(
+            f"<details>\n<summary>跳過的 {len(skipped)} 筆（點開展開）</summary>\n"
+            f"<ul>\n{skip_rows}</ul>\n</details>\n"
+        )
+
+    parts.append("<h2>簡訊內容（將發送給以上每一位）</h2>\n")
+    parts.append(f'<div class="preview-body">{_e(body)}</div>\n')
+
+    parts.append('<form method="post" action="/send" accept-charset="UTF-8">\n')
+    parts.append(f'<input type="hidden" name="token" value="{_e(token)}">\n')
+    parts.append(
+        f'<button type="submit" class="danger">確定送出（共扣 {total_cost} 點）</button>\n'
+    )
+    parts.append("</form>\n")
+    parts.append(_back_link("← 改一下再送"))
+
+    return _page("確認批次發送內容", "".join(parts))
+
+
+def render_batch_result(
+    *,
+    sent: list[dict],
+    not_charged: list[dict],
+    unconfirmed: list[dict],
+    body: str,
+    audit_failures: "list[dict] | None" = None,
+) -> str:
+    """批次結果頁（多人模式 ``POST /send`` 的回應）。
+
+    三組互斥分類，與單人模式 :func:`render_sent` / :func:`render_failed_safe` /
+    :func:`render_failed_unconfirmed` 同一套鐵律，只是攤成三份清單：
+
+    * ``sent``：已送達三竹（不等於已送達手機，同 :func:`render_sent` 的提醒）。
+      純顯示，不提供任何動作。每筆需要 ``phone`` 與（選填的）``msgid``。
+    * ``not_charged``：確定沒扣點的失敗。**多數可以**重送，但重送一律重新走
+      一次確認頁（見 :func:`_hidden_batch_resend_form`），不是一鍵直接花錢。
+      每筆需要 ``phone`` 與 ``reason``（人類看得懂的失敗原因），選填
+      ``allow_resend``（預設 ``True``）——IP 不在白名單／帳密錯這類帳號層級的
+      設定問題傳 ``False``：重送不會成功，給入口只是誘人對著整份名單白按。
+      只有 ``allow_resend`` 為真的那幾筆會被塞進重送表單；一筆都不能重送時
+      不渲染任何 ``<form>``，改用一句話說明原因。
+    * ``unconfirmed``：可能已扣點。**這一組絕對不可以有任何 ``<form>``**——
+      同 :func:`render_failed_unconfirmed` 的鐵律，這是本頁最容易改壞的地方：
+      「順手」在這裡加個重送按鈕，代價是扣兩次點、對方收到兩封。
+      每筆需要 ``phone`` 與（選填的）``msgid``。
+
+    ``audit_failures``：這一批裡稽核紀錄寫入失敗的筆數（每筆 ``phone`` 與選填
+    ``msgid``）。稽核檔是事後唯一能回答「這一點是誰燒的、送出去沒有」的東西，
+    寫失敗卻讓這頁看起來一片乾淨的「已送達」，操作者會完全不知道這批可能沒
+    留底——所以只要非空，就在**頁面最上方**（三個分組之前）渲染一個醒目警示框，
+    列出這幾筆的遮罩號碼與 msgid，要求操作者立刻手動記下。與單人模式
+    :func:`render_failed_unconfirmed` 對 ``audit_ok=False`` 的處理同一種精神，
+    但這裡可能同時橫跨 ``sent``/``not_charged``/``unconfirmed`` 三組，故獨立
+    成一個不分組的警示框，而不是塞進某一組底下。
+    """
+    parts = ["<h1>批次發送結果</h1>\n"]
+
+    if audit_failures:
+        rows = "".join(
+            "<li>{}{}</li>\n".format(
+                _e(_mask_recipient_phone(item.get("phone"))),
+                (
+                    f'　msgid：<span class="msgid">{_e(str(item["msgid"]))}</span>'
+                    if item.get("msgid")
+                    else "（無 msgid）"
+                ),
+            )
+            for item in audit_failures
+        )
+        parts.append(
+            _box(
+                "danger",
+                f"⚠️ 這 {len(audit_failures)} 筆稽核紀錄寫入失敗，請立刻手動記下",
+                "<p>稽核檔是事後唯一能回答「這幾點是誰燒的、有沒有送出去」的東西，"
+                "以下這幾筆<strong>沒有留底</strong>。請立刻手動記下遮罩號碼與 "
+                "msgid（若有），並記下現在的日期與時間；原因請看 "
+                "<code>journalctl -u mitake-web</code>（多半是磁碟滿或稽核檔"
+                "路徑不可寫）。</p>\n"
+                f"<ul>\n{rows}</ul>\n",
+            )
+        )
+
+    if sent:
+        rows = "".join(
+            "<li>{}{}</li>\n".format(
+                _e(_mask_recipient_phone(item.get("phone"))),
+                (
+                    f'　msgid：<span class="msgid">{_e(str(item["msgid"]))}</span>'
+                    if item.get("msgid")
+                    else "（三竹未回傳 msgid）"
+                ),
+            )
+            for item in sent
+        )
+        parts.append(_box("ok", f"✅ 已送達三竹 {len(sent)} 筆", f"<ul>\n{rows}</ul>\n"))
+
+    if not_charged:
+        rows = "".join(
+            f'<li>{_e(_mask_recipient_phone(item.get("phone")))}'
+            f'　{_e(str(item.get("reason", "")))}</li>\n'
+            for item in not_charged
+        )
+        inner = f"<ul>\n{rows}</ul>\n"
+        # 只有 allow_resend 不是 False 的那幾筆能進重送表單——IP 白名單／帳密錯
+        # 這類帳號層級設定問題重送不會成功，見本函式 docstring。預設值 True，
+        # 沒帶這個 key 的舊呼叫端（理論上只有本檔自己）視為可重送，行為不變。
+        resendable_phones = [
+            str(item["phone"]) for item in not_charged if item.get("allow_resend", True)
+        ]
+        if resendable_phones:
+            heading = f"❌ 未扣點失敗 {len(not_charged)} 筆，可重送"
+            inner += _hidden_batch_resend_form(
+                resendable_phones,
+                body,
+                f"重新確認並發送這 {len(resendable_phones)} 筆未扣點失敗的號碼",
+            )
+            if len(resendable_phones) < len(not_charged):
+                inner += (
+                    '<p class="muted">其餘幾筆是帳號層級的設定問題（IP 白名單／'
+                    "帳密錯），重送不會成功，未列入上方重送名單，請先修正設定。"
+                    "</p>\n"
+                )
+        else:
+            heading = f"❌ 未扣點失敗 {len(not_charged)} 筆，這些是設定問題，重送不會成功"
+            inner += (
+                '<p class="muted">全部都是帳號層級的設定問題（IP 白名單／帳密錯），'
+                "重送一百次也一樣失敗，請先修正設定後再重新上傳名單。</p>\n"
+            )
+        parts.append(_box("error", heading, inner))
+
+    if unconfirmed:
+        rows = "".join(
+            "<li>{}{}</li>\n".format(
+                _e(_mask_recipient_phone(item.get("phone"))),
+                (
+                    f'　msgid：<span class="msgid">{_e(str(item["msgid"]))}</span>'
+                    if item.get("msgid")
+                    else "（三竹未回傳 msgid）"
+                ),
+            )
+            for item in unconfirmed
+        )
+        parts.append(
+            _box(
+                "danger",
+                f"⚠️ 未確認 {len(unconfirmed)} 筆，請勿對這幾筆重送",
+                "<p>請求已經送到三竹，只是回應無法確認，這幾筆的點數很可能已經扣掉、"
+                "簡訊也可能已經送達。請到三竹後台以下方 msgid 逐筆查證，"
+                "確定沒送出再回表單重新填寫。</p>\n"
+                f"<ul>\n{rows}</ul>\n",
+            )
+        )
+
+    if not sent and not not_charged and not unconfirmed:
+        # 理論上不會發生（有效名單至少一筆才會走到 /send），但防禦性地給個說明，
+        # 總比一頁空白讓人以為系統壞了要好。
+        parts.append(_box("warn", "沒有任何發送結果", "<p>本次批次沒有任何收件人。</p>\n"))
+
+    parts.append(_back_link("← 回到發送表單"))
+    return _page("批次發送結果", "".join(parts))
 
 
 def render_sent(

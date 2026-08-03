@@ -220,15 +220,28 @@ class AuditLog:
     # ------------------------------------------------------------------ #
 
     def record_attempt(
-        self, *, request_id: str, phone: str, segments: int, chars: int
+        self,
+        *,
+        request_id: str,
+        phone: str,
+        segments: int,
+        chars: int,
+        batch_id: str | None = None,
     ) -> bool:
-        """送出前的留底。有 attempt 卻沒有對應 result＝那次發送死在半路，需人工查證。"""
+        """送出前的留底。有 attempt 卻沒有對應 result＝那次發送死在半路，需人工查證。
+
+        ``batch_id`` 是選填的批次識別碼（多人模式一次批次共用同一個值）：單筆
+        發送不傳這個參數，維持 ``None``，既有呼叫端與稽核檔內容因此完全不受影響。
+        有了它才能在 ``send-audit.jsonl`` 裡用同一個值把同一批的 N 筆記錄串起來
+        （見 doc/spec-multi-recipient-sms.md §5）。
+        """
         return self.record(
             "attempt",
             request_id=request_id,
             phone_masked=mask_phone(phone),
             segments=segments,
             chars=chars,
+            batch_id=batch_id,
         )
 
     def record_result(
@@ -244,11 +257,14 @@ class AuditLog:
         possibly_charged: bool = False,
         error_kind: str | None = None,
         error_message: object = None,
+        batch_id: str | None = None,
     ) -> bool:
         """送出後的留底。
 
         ``possibly_charged`` 一定要寫進去：日後對帳時，「失敗」這兩個字沒有告訴你
         點數扣了沒，只有這個欄位有。
+
+        ``batch_id`` 同 :meth:`record_attempt`：選填、單筆發送不傳，維持 ``None``。
         """
         return self.record(
             "result",
@@ -262,4 +278,5 @@ class AuditLog:
             possibly_charged=bool(possibly_charged),
             error_kind=error_kind,
             error=_truncate(error_message),
+            batch_id=batch_id,
         )
