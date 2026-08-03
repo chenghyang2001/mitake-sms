@@ -25,10 +25,13 @@
   :func:`default_trial_audit_path`），與 :mod:`web.audit` 的 ``send-audit.jsonl``
   分開——那是三竹簡訊的稽核，這是 Email 的稽核，兩個子系統的成本模型不同，
   混在同一份檔案只會讓事後對帳更難過濾。
-* 已用天數 / 總天數的重新驗證直接呼叫 :func:`web.templates._parse_trial_day_count`
-  （上一輪已經寫好、QA 過的函式），刻意不重寫第二份解析邏輯 —— 兩邊對「14」
-  「14 天」這種字串的解讀若不同步，會出現「畫面上按鈕可點，但伺服器端又擋下」
-  這種使用者無法理解的落差。``web.templates`` 目前**不會**在執行期匯入
+* 已用天數的重新驗證改呼叫 :func:`web.templates._compute_used_days`（今天－接機日
+  動態算，``today`` 可注入測試固定日期），不再信任 producer 快照的 ``used_days``
+  字串——那份快照只在 producer 重新跑一次時才會更新，兩次同步之間會凍結在舊數字
+  （2026-08-03 修正）。總天數仍呼叫 :func:`web.templates._parse_trial_day_count`
+  讀 producer 快照的 ``days`` 欄（那是活動設定值，不是日期能推出來的）。兩邊對
+  「14」「14 天」這種字串的解讀若不同步，會出現「畫面上按鈕可點，但伺服器端又
+  擋下」這種使用者無法理解的落差。``web.templates`` 目前**不會**在執行期匯入
   ``web.recipients`` 或 ``web.trial_report``（只有 ``TYPE_CHECKING`` 用途），
   所以這裡反向匯入它不會造成循環匯入。
 
@@ -49,7 +52,7 @@ import tempfile
 import textwrap
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from email.errors import MessageError
 from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
@@ -58,7 +61,7 @@ from pathlib import Path
 from typing import Any
 
 from web.recipients import Recipient
-from web.templates import _parse_trial_day_count
+from web.templates import _compute_used_days, _parse_trial_day_count
 from web.audit import AuditLog
 
 __all__ = [
@@ -897,6 +900,7 @@ def send_trial_report(
     email_sender: Callable[..., bool] | None = None,
     staff_bcc: Sequence[str] = (),
     audit_log: AuditLog | None = None,
+    today: date | None = None,
 ) -> TrialReportResult:
     """驗證資格 → 撈 14 天 telemetry → 產報告 → 寄 Email → 留稽核紀錄。
 
@@ -911,14 +915,20 @@ def send_trial_report(
 
     ``audit_log`` 未傳時使用 :func:`default_trial_audit_path` 的預設位置；
     測試同樣應該注入指到 ``tmp_path`` 的實例，避免污染 repo 底下的稽核檔。
+
+    ``today`` 只給測試注入固定日期用（傳給 :func:`web.templates._compute_used_days`
+    算已用天數）；生產環境不傳，該函式會固定用 ``Asia/Taipei`` 曆日（不隨 VPS
+    系統時區漂移），理由見 :func:`web.templates._compute_used_days` 的 docstring。
     """
     audit = audit_log if audit_log is not None else _default_audit_log()
     recipient_id = recipient.id
 
     # 1-2. 伺服器端重新驗證「已用天數 >= 天數」。**不信任前端按鈕的 disabled
     # 狀態**（devtools 可以繞過），一律用 web.templates 那份已驗證過的解析邏輯
-    # 重算一次，兩邊不同步會出現「畫面能點、伺服器又擋」的落差。
-    used = _parse_trial_day_count(recipient.used_days)
+    # 重算一次，兩邊不同步會出現「畫面能點、伺服器又擋」的落差。這裡連 producer
+    # 快照的 used_days 都不再信任，只信任接機日（borrow_date）動態算——快照只在
+    # producer 重新跑一次時才會更新，兩次同步之間會凍結在舊數字。
+    used = _compute_used_days(recipient.borrow_date, today=today)
     total = _parse_trial_day_count(recipient.days)
     if used is None or total is None or used < total:
         return _fail(

@@ -1,16 +1,29 @@
 # 核心模組（mitake.py）零外部依賴 —— 只用標準庫的 urllib 完成 HTTP 呼叫。
 #
 # 為什麼刻意不用 requests：本工具部署在 VPS 上長期跑餘額告警，
-# 少一個第三方套件就少一條供應鏈與升級維護的路徑。這個原則對 mitake.py 與
-# web/ 主體（表單、發送、稽核）依然成立，一個字都沒變。
+# 少一個第三方套件就少一條供應鏈與升級維護的路徑。這個原則對 mitake.py 依然成立，
+# 一個字都沒變。web/ 主體（表單、發送、稽核）原則上同樣零依賴，但 2026-08-03
+# 起多了 tzdata 這個例外（見下方說明）。
 #
 # 執行測試需要 pytest，但那是開發期工具，不列在此檔（見 requirements-dev.txt，尚未建立）。
 # Web 階段才會加入 Flask，現在不要預先加。
 #
-# 以下兩個是唯一的例外，只給 web/trial_report.py（/trial-email「寄送體驗報告」
-# 功能）用——它要查 acfh_api（AIHCR 場域資料庫）並畫 PDF 折線圖，這兩件事標準庫
-# 做不到。兩者都在 web/trial_report.py 內部延遲 import（函式內才 import，不在
-# 模組頂層），所以即使某台機器沒裝這兩個套件，mitake.py 與 web/ 其餘零依賴的
-# 簡訊發送介面仍能正常載入與運作，壞掉的只會是「寄送體驗報告」這個獨立功能。
+# tzdata：web/templates.py 的 `_compute_used_days()` 用 zoneinfo.ZoneInfo("Asia/Taipei")
+# 把「已用天數」固定用台灣曆日計算（不隨系統時區漂移，理由見該函式 docstring）。
+# `zoneinfo` 本身是標準庫（3.9+），但它依賴平台系統自帶的 IANA 時區資料庫；
+# 標準 Ubuntu VPS 出廠就有 /usr/share/zoneinfo，理論上不需要這個套件也能跑，但
+# Windows（本專案兩台開發機 B00332／使用者家用機都是 Windows）**沒有**內建 IANA
+# 資料庫，缺這個套件會讓 ZoneInfo("Asia/Taipei") 直接拋
+# zoneinfo.ZoneInfoNotFoundError，導致整個 /trial-email 頁面 500——這不是「寄送
+# 體驗報告」那個獨立功能壞掉，而是連唯讀表格本身都打不開，代價比 pymysql／
+# matplotlib 兩個例外都高，所以刻意列成正式依賴（不像那兩個延遲 import 就好），
+# 在 VPS 上裝了也只是白白多一份 pure-data 套件、不影響任何行為。
+tzdata
+#
+# 以下兩個只給 web/trial_report.py（/trial-email「寄送體驗報告」功能）用——
+# 它要查 acfh_api（AIHCR 場域資料庫）並畫 PDF 折線圖，這兩件事標準庫做不到。
+# 兩者都在 web/trial_report.py 內部延遲 import（函式內才 import，不在模組頂層），
+# 所以即使某台機器沒裝這兩個套件，mitake.py 與 web/ 其餘零依賴的簡訊發送介面
+# 仍能正常載入與運作，壞掉的只會是「寄送體驗報告」這個獨立功能。
 pymysql
 matplotlib

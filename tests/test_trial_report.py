@@ -24,7 +24,7 @@ COMPLEXITY: complex（本檔覆蓋 doc/spec-trial-report.md 的核心邏輯 1-9 
 from __future__ import annotations
 
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -178,14 +178,21 @@ def _make_recipient(
     days: str = "14",
     used_days: str = "14",
     name: str = "陳筱琪",
+    borrow_date: str = "2026-07-01",
 ) -> Recipient:
-    """一筆已達體驗天數、id 格式正常的 Recipient（多數測試的基準情境）。"""
+    """一筆已達體驗天數、id 格式正常的 Recipient（多數測試的基準情境）。
+
+    ``used_days`` 現在只是 Recipient 上的展示欄位，不再影響 ``send_trial_report``
+    的天數驗證邏輯（改用 ``borrow_date`` 動態算，見 ``web.templates._compute_used_days``）
+    ——呼叫端若要控制驗證結果，改傳 ``borrow_date`` 並搭配 ``send_trial_report(...,
+    today=...)`` 顯式注入固定日期，不要再依賴 ``used_days``。
+    """
     return Recipient(
         id=recipient_id,
         name=name,
         phone="0912345678",
         device="體驗機",
-        borrow_date="2026-07-01",
+        borrow_date=borrow_date,
         match_status="ok",
         days=days,
         used_days=used_days,
@@ -257,6 +264,10 @@ def test_success_happy_path_sends_email_with_pdf(tmp_path: Path, monkeypatch: py
         email_sender=sender,
         staff_bcc=("staff@example.com",),
         audit_log=audit,
+        # 顯式注入固定日期（借機日 2026-07-01 起算 19 天，確定 >= 14 天達標）——
+        # 不依賴執行測試當下的真實 wall-clock 日期，即使 today 剛好落在合理值,
+        # 也不該讓測試結果隨執行日期漂移。
+        today=date(2026, 7, 20),
     )
 
     assert result.success is True
@@ -286,6 +297,7 @@ def test_success_recipient_id_passed_to_default_hours_constant(
         conn_factory=lambda: conn,
         email_sender=RecordingEmailSender(),
         audit_log=_make_audit(tmp_path),
+        today=date(2026, 7, 20),  # 借機日 2026-07-01 起算 19 天，確定 >= 14 天達標
     )
     _sql, params = next((s, p) for s, p in conn.executed if "FROM device_telemetry" in s)
     _device_id, since_str = params
@@ -305,7 +317,11 @@ def test_success_recipient_id_passed_to_default_hours_constant(
 def test_blocks_when_days_not_reached_without_touching_db(
     tmp_path: Path,
 ) -> None:
-    """已用天數 < 天數 → 擋下，且完全不呼叫 conn_factory（不碰 DB）。"""
+    """已用天數（今天－接機日動態算）< 天數 → 擋下，且完全不呼叫 conn_factory（不碰 DB）。
+
+    ``used_days`` 欄位已不再影響驗證邏輯，改用 borrow_date（預設 2026-07-01）
+    搭配注入 today=2026-07-04（3 天）製造「未達標」情境。
+    """
     conn_factory_called = []
 
     def _conn_factory():
@@ -314,10 +330,11 @@ def test_blocks_when_days_not_reached_without_touching_db(
 
     sender = RecordingEmailSender()
     result = send_trial_report(
-        _make_recipient(days="14", used_days="3"),
+        _make_recipient(days="14"),
         conn_factory=_conn_factory,
         email_sender=sender,
         audit_log=_make_audit(tmp_path),
+        today=date(2026, 7, 4),
     )
 
     assert result.success is False
@@ -327,9 +344,13 @@ def test_blocks_when_days_not_reached_without_touching_db(
 
 
 def test_blocks_when_day_fields_unparseable(tmp_path: Path) -> None:
-    """days/used_days 完全解析不出數字（真實世界髒資料）→ 保守擋下，不猜。"""
+    """days 解析不出數字、borrow_date 格式壞掉（真實世界髒資料）→ 保守擋下，不猜。
+
+    ``used_days`` 已不再是「已用天數」的來源，改讓 borrow_date 本身格式跑掉
+    （不是合法 ``YYYY-MM-DD``），驗證 ``_compute_used_days`` 解析失敗一樣被擋下。
+    """
     result = send_trial_report(
-        _make_recipient(days="", used_days=""),
+        _make_recipient(days="", borrow_date="不是日期"),
         conn_factory=lambda: (_ for _ in ()).throw(AssertionError("不該呼叫")),
         email_sender=RecordingEmailSender(),
         audit_log=_make_audit(tmp_path),
@@ -339,7 +360,7 @@ def test_blocks_when_day_fields_unparseable(tmp_path: Path) -> None:
 
 
 def test_days_reval_handles_real_world_format_with_suffix(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """真實世界格式「14 天」/「14 天」也要能正確判定已達標並繼續往下走。"""
+    """真實世界格式「14 天」的 total 也要能正確判定已達標並繼續往下走。"""
     monkeypatch.setattr(trial_report, "setup_cjk_font", lambda: False)
     conn = FakeConnection(
         devices=_make_devices(),
@@ -347,12 +368,67 @@ def test_days_reval_handles_real_world_format_with_suffix(tmp_path: Path, monkey
         telemetry_rows=_make_telemetry_rows(),
     )
     result = send_trial_report(
-        _make_recipient(days="14 天", used_days="14 天"),
+        _make_recipient(days="14 天"),
         conn_factory=lambda: conn,
         email_sender=RecordingEmailSender(),
         audit_log=_make_audit(tmp_path),
+        today=date(2026, 7, 20),  # 借機日 2026-07-01 起算 19 天，確定 >= 14 天達標
     )
     assert result.success is True
+
+
+def test_same_recipient_gating_flips_purely_with_injected_today(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Integration：同一筆 recipient（固定 borrow_date），光是換 `today` 注入值，
+    寄送資格判斷就跟著變 —— 這正是本次改動要解決的問題。
+
+    舊邏輯（讀 producer 快照的 used_days 字串）無論「今天」是哪天，判斷結果都
+    不會變，因為快照只在 producer 重新跑一次時才更新。改成「今天－接機日」動態算
+    之後，同一筆資料在不同的「今天」底下應該給出不同的資格判斷：
+    * today 落在達標之後 → 確實往下走到 DB/email 邏輯（不被 REASON_DAYS_NOT_REACHED 擋下）。
+    * today 落在達標之前 → 確實被 REASON_DAYS_NOT_REACHED 擋下、且完全不呼叫 conn_factory。
+    """
+    monkeypatch.setattr(trial_report, "setup_cjk_font", lambda: False)
+    recipient = _make_recipient(days="14", borrow_date="2026-07-01")
+
+    # 情境一：today 落在達標之後（起算 19 天）→ 確實走到 DB/email 邏輯。
+    conn = FakeConnection(
+        devices=_make_devices(),
+        user_row={"first_name": "琪", "last_name": "陳", "email": "a@example.com"},
+        telemetry_rows=_make_telemetry_rows(),
+    )
+    sender_reached = RecordingEmailSender()
+    result_reached = send_trial_report(
+        recipient,
+        conn_factory=lambda: conn,
+        email_sender=sender_reached,
+        audit_log=_make_audit(tmp_path),
+        today=date(2026, 7, 20),
+    )
+    assert result_reached.success is True
+    assert result_reached.reason is None
+    assert len(sender_reached.calls) == 1
+
+    # 情境二：同一筆 recipient，today 改落在達標之前（起算 3 天）→ 擋下，不碰 DB。
+    conn_factory_called: list[bool] = []
+
+    def _conn_factory_not_reached():
+        conn_factory_called.append(True)
+        raise AssertionError("未達標時不該呼叫 conn_factory")
+
+    sender_not_reached = RecordingEmailSender()
+    result_not_reached = send_trial_report(
+        recipient,
+        conn_factory=_conn_factory_not_reached,
+        email_sender=sender_not_reached,
+        audit_log=_make_audit(tmp_path),
+        today=date(2026, 7, 4),
+    )
+    assert result_not_reached.success is False
+    assert result_not_reached.reason == REASON_DAYS_NOT_REACHED
+    assert conn_factory_called == []
+    assert sender_not_reached.calls == []
 
 
 # --------------------------------------------------------------------------- #
@@ -519,12 +595,14 @@ def test_audit_record_written_on_success_without_plaintext_email(
 
 
 def test_audit_record_written_on_failure(tmp_path: Path) -> None:
+    """借機日 2026-07-01 起算 1 天（注入 today=2026-07-02），未達標 → 擋下留稽核。"""
     audit = _make_audit(tmp_path)
     send_trial_report(
-        _make_recipient(days="14", used_days="1"),
+        _make_recipient(days="14"),
         conn_factory=lambda: (_ for _ in ()).throw(AssertionError("不該呼叫")),
         email_sender=RecordingEmailSender(),
         audit_log=audit,
+        today=date(2026, 7, 2),
     )
     records = _read_audit_records(audit)
     assert len(records) == 1
@@ -536,10 +614,11 @@ def test_audit_log_survives_missing_parent_directory(tmp_path: Path) -> None:
     """稽核檔目錄不存在時（AuditLog 內部會自動 mkdir）不 crash，且結果照常回傳。"""
     audit = AuditLog(tmp_path / "not-yet-created" / "trial-report-audit.jsonl", fsync=False)
     result = send_trial_report(
-        _make_recipient(days="14", used_days="1"),
+        _make_recipient(days="14"),
         conn_factory=lambda: (_ for _ in ()).throw(AssertionError("不該呼叫")),
         email_sender=RecordingEmailSender(),
         audit_log=audit,
+        today=date(2026, 7, 2),
     )
     assert result.success is False
     assert audit.path.exists()

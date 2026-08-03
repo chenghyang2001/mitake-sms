@@ -103,7 +103,7 @@ user lives here once, so fixing it once fixes it everywhere.
 - Deliberately **does not check `query_balance()` before `send_sms()`** — that would introduce a
   TOCTOU race against the App team draining the same pool between the check and the send.
 
-### `web/` — the send/status HTTP interface (stdlib `http.server`, zero third-party deps — except `trial_report.py`, see below)
+### `web/` — the send/status HTTP interface (stdlib `http.server`, zero third-party deps — except `trial_report.py` and the `tzdata` package, see below)
 
 - `server.py` — routes, two-phase send (`POST /preview` → one-time token → `POST /send`), a sliding
   per-hour segment-based rate limiter, a separate free-query throttle for `/status`, and an
@@ -114,7 +114,14 @@ user lives here once, so fixing it once fixes it everywhere.
 - `templates.py` — HTML generation; all user input goes through `html.escape`. Deliberately does
   **not** import `mitake` (see `web/__init__.py` docstring — import-order fragility isn't worth it
   for a handful of string constants, so a few classification strings are duplicated and locked down
-  by tests instead).
+  by tests instead). `_compute_used_days()` imports stdlib `zoneinfo` and resolves
+  `ZoneInfo("Asia/Taipei")` at call time (only when `today` isn't injected) — `zoneinfo` itself needs
+  no third-party package to *import*, but resolving a zone key depends on the platform having an IANA
+  time zone database available, which Windows doesn't ship natively. `requirements.txt` therefore
+  lists `tzdata` as a real (non-lazy) dependency: without it, this call raises
+  `zoneinfo.ZoneInfoNotFoundError` on Windows, which is uncaught and 500s the entire `/trial-email`
+  page, not just the report-sending feature — a bigger blast radius than the `pymysql`/`matplotlib`
+  exception below, hence not deferred with a lazy import.
 - `audit.py` — send audit log (`send-audit.jsonl`, phone numbers masked to last 4 digits); the rate
   limiter replays this file on startup to avoid resetting quotas on every restart.
 - `recipients.py` — loads the optional recipient dropdown from `MITAKE_WEB_RECIPIENTS_PATH`;
@@ -131,8 +138,13 @@ user lives here once, so fixing it once fixes it everywhere.
   reaches full term. Every DB/SMTP touchpoint is behind an injectable `conn_factory` /
   `email_sender` (same pattern as `server.py`'s `sender`/`recipient_source`), so tests never hit
   the real `acfh_api` database or send a real email. The server re-validates "used days ≥ total
-  days" independently server-side using the exact same `_parse_trial_day_count` the button's
-  enable/disable state uses — never trusts the frontend's `disabled` attribute. Customers with
+  days" independently server-side — never trusts the frontend's `disabled` attribute. "Used days"
+  is computed dynamically from `web.templates._compute_used_days(borrow_date, today=...)` (today
+  minus the pickup date), not read from the producer snapshot's `used_days` string, which only
+  updates when the producer re-runs and would otherwise freeze at a stale count between syncs.
+  "Total days" still comes from `_parse_trial_day_count` reading the producer snapshot's `days`
+  field (that's a campaign setting, not something a date can derive). `today` is injectable for
+  tests; production callers omit it and get the real server date. Customers with
   anything other than exactly 1 active device are refused, not guessed at. See
   `doc/spec-trial-report.md` for the full spec and known limitations (no multi-device support, no
   duplicate-send protection).

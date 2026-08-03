@@ -21,9 +21,11 @@
 from __future__ import annotations
 
 import re
+from datetime import date, datetime
 from html import escape as _e
 from typing import TYPE_CHECKING
 from urllib.parse import quote as _q
+from zoneinfo import ZoneInfo
 
 if TYPE_CHECKING:
     # 只給型別檢查用：本檔在**執行期**刻意不 import web.recipients，維持與「不 import
@@ -547,6 +549,42 @@ def _parse_trial_day_count(value: str) -> int | None:
     """
     match = re.match(r"\d+", value)
     return int(match.group()) if match else None
+
+
+def _compute_used_days(borrow_date: str, *, today: date | None = None) -> int | None:
+    """用「今天－接機日」動態算出已用天數，取代 producer 快照裡的 used_days 字串。
+
+    接機日（``borrow_date``）是 producer 固定產出的 ``YYYY-MM-DD`` 字串，是唯一
+    不受 producer 多久沒重新同步影響的事實來源——舊做法直接信任 producer 快照的
+    ``used_days`` 字串，只在 producer 重跑那一刻才會更新，兩次同步之間會凍結在
+    舊數字（2026-08-03 踩到：某客戶接機日 07-20、天數 14 天，producer 上次同步
+    是 07-30，used_days 停在 10 天，實際上到 08-03 已經滿 14 天，畫面卻還顯示未達標）。
+
+    ``today`` 可注入：未傳時**刻意固定用 ``Asia/Taipei``**，不隨 VPS 系統時區漂移
+    ——``borrow_date``（接機日）語意上是 AIHCR 業務登記用的**台灣曆日**，而
+    ``HANDOFF.md`` 明文記載 VPS 系統時區是 UTC（`n8n2vps-hub` 的 APScheduler 因此
+    特地手動設定 `Asia/Taipei` 來避開這個坑）。若改用系統本地時區（VPS 上即 UTC），
+    會在台灣時間 00:00–08:00（＝ UTC 前一天 16:00–24:00）這 8 小時窗口內把「今天」
+    少算 1 天——客戶接機滿 14 天的那一刻其實已經到了台灣午夜，畫面卻要等到台灣
+    早上 8 點才會顯示達標、按鈕才解鎖，這正是本函式要解決的「畫面不準」問題的
+    變形版，沒理由留著。測試務必顯式傳入固定日期，不依賴真實 wall-clock。
+
+    接機日解析失敗（格式跑掉、空字串）回 ``None``，呼叫端一律當「無法判斷」保守
+    處理（不可點、不可寄）——不做任何猜測。
+
+    接機日若落在未來（producer 髒資料的可能情況）回傳 ``0``（不回負數）：這是
+    刻意保留的行為（見 tests/test_web.py 的對應測試），0 天在邏輯上仍然安全
+    （必然小於任何合理的總天數，不會誤解鎖），但這也代表呼叫端無法從回傳值本身
+    分辨「剛接機、0 天」與「接機日資料異常」——這個決定不影響安全性，只是還沒
+    對 producer 資料品質做進一步分類。
+    """
+    try:
+        start = date.fromisoformat(borrow_date)
+    except ValueError:
+        return None
+    if today is None:
+        today = datetime.now(ZoneInfo("Asia/Taipei")).date()
+    return max((today - start).days, 0)
 
 
 # 分類 →（方塊樣式, 標題）。key 必須與 ``mitake.DELIVERY_*`` 的值完全一致。
@@ -1289,14 +1327,15 @@ def render_status_result(
 # --------------------------------------------------------------------------- #
 
 
-def render_trial_email(book: "RecipientBook") -> str:
+def render_trial_email(book: "RecipientBook", *, today: date | None = None) -> str:
     """「體驗借出管理」頁（``GET /trial-email``）。
 
     鏡像 AIHCR 的體驗借出管理頁：把 producer 產出、consumer 解析後的體驗借出名單
     渲染成一張唯讀表格（設備／客戶／接機日／天數／已用天／業務／狀態／寄送體驗報告）。
     最後一欄「寄送體驗報告」是一顆會真的 POST 到 ``/trial-email/send-report`` 的
     ``<form>``（帶隱藏欄位 ``recipient_id``），依該列已用天數是否達到天數決定按鈕
-    可否點擊（見 :func:`_parse_trial_day_count`）——**但這只是前端的省事提示**，
+    可否點擊（「已用天」現在是用 :func:`_compute_used_days` 動態算的，「天數」仍用
+    :func:`_parse_trial_day_count` 讀 producer 快照）——**但這只是前端的省事提示**，
     伺服器端（:func:`web.trial_report.send_trial_report`）一定會重新驗證一次，
     devtools 移除 disabled 屬性也不會真的寄出報告。除了這顆按鈕會觸發寄信之外，
     整頁其餘部分**仍是純唯讀**：不會因為打開這頁本身就寄出任何郵件。資料同樣讀
@@ -1308,6 +1347,9 @@ def render_trial_email(book: "RecipientBook") -> str:
 
     ``book`` 沿用 duck typing：只呼叫 ``is_empty()`` / ``all()`` / ``generated_at``，
     不需要真的持有 RecipientBook 類別（本檔執行期刻意不 import web.recipients）。
+
+    ``today`` 只給測試注入固定日期用；生產環境（``web.server`` 的呼叫端）不傳，
+    自動用伺服器真實日期（見 :func:`_compute_used_days`）。
     """
     parts = ["<h1>🎁 體驗借出管理</h1>\n"]
     parts.append(
@@ -1330,19 +1372,20 @@ def render_trial_email(book: "RecipientBook") -> str:
     # 這是本檔「任何進入 HTML 的輸入都先跳脫」那條規則，不為「來自名單」開特例。
     rows = []
     for rec in book.all():
-        used = _parse_trial_day_count(rec.used_days)
+        used = _compute_used_days(rec.borrow_date, today=today)
         total = _parse_trial_day_count(rec.days)
         # 保守預設：兩者都解析成功、且已用天數 >= 總天數才可點；解析失敗一律當不可用，
         # 與本檔既有「欄位缺漏一律不 crash、當作不可用」的風格一致。
         is_completed = used is not None and total is not None and used >= total
         disabled_attr = "" if is_completed else " disabled"
+        used_display = f"{used} 天" if used is not None else "無法判斷"
         rows.append(
             "<tr>"
             f"<td>{_e(rec.device)}</td>"
             f"<td>{_e(rec.name)}</td>"
             f"<td>{_e(rec.borrow_date)}</td>"
             f"<td>{_e(rec.days)}</td>"
-            f"<td>{_e(rec.used_days)}</td>"
+            f"<td>{_e(used_display)}</td>"
             f"<td>{_e(rec.business)}</td>"
             f"<td>{_e(rec.trial_status)}</td>"
             "<td>"

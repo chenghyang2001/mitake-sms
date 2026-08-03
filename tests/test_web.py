@@ -44,7 +44,8 @@ import threading
 import urllib.error
 import urllib.request
 from collections.abc import Callable
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from email.message import Message
 from html import escape as _html_escape
 from http import HTTPStatus
@@ -2446,13 +2447,12 @@ def test_trial_email_escapes_cell_values(tmp_path: Path) -> None:
     assert "&lt;script&gt;x&lt;/script&gt;" in text
 
 
-def test_trial_email_send_report_button_enabled_when_used_days_reaches_total(
-    tmp_path: Path,
-) -> None:
-    """已用天數 == 天數（乾淨數字字串）→「寄送體驗報告」按鈕要可點（無 disabled）。
+def test_trial_email_send_report_button_enabled_when_used_days_reaches_total() -> None:
+    """已用天數（今天－接機日動態算）== 天數 →「寄送體驗報告」按鈕要可點（無 disabled）。
 
-    這是按鈕啟用規則的 happy path：兩個欄位都能解析成乾淨整數，且已達標，
-    對應「已用天 >= 天數」時按鈕可點的規則。
+    這是按鈕啟用規則的 happy path：接機日 2026-07-20、注入 today=2026-08-03，
+    剛好滿 14 天，對應「已用天 >= 天數」時按鈕可點的規則。``used_days`` 欄位
+    已不再影響按鈕邏輯（改用 borrow_date 動態算），刻意留空字串以證明這點。
     """
     book = RecipientBook(
         [
@@ -2461,18 +2461,17 @@ def test_trial_email_send_report_button_enabled_when_used_days_reaches_total(
                 name="測試",
                 phone=None,
                 device="體驗機",
-                borrow_date="2026-07-29",
+                borrow_date="2026-07-20",
                 match_status="ok",
                 days="14",
-                used_days="14",
+                used_days="",
                 business="王小明",
                 trial_status="🟢 體驗中",
             ),
         ],
     )
-    app = make_app(tmp_path, RecordingSender(), recipient_source=lambda: book)
 
-    text = app.route("GET", "/trial-email").text
+    text = templates.render_trial_email(book, today=date(2026, 8, 3))
 
     assert "寄送體驗報告" in text
     assert "<button" in text
@@ -2482,12 +2481,11 @@ def test_trial_email_send_report_button_enabled_when_used_days_reaches_total(
     assert "disabled" not in match.group()
 
 
-def test_trial_email_send_report_button_disabled_when_used_days_below_total(
-    tmp_path: Path,
-) -> None:
-    """已用天數 < 天數 → 按鈕要灰階不可點（含 disabled 屬性）。
+def test_trial_email_send_report_button_disabled_when_used_days_below_total() -> None:
+    """已用天數（今天－接機日動態算）< 天數 → 按鈕要灰階不可點（含 disabled 屬性）。
 
-    這是啟用規則的邊界案例：還沒體驗到期，不該讓人誤按去寄體驗報告。
+    這是啟用規則的邊界案例：接機日 2026-07-20、注入 today=2026-07-25，只過了
+    5 天，還沒體驗到期，不該讓人誤按去寄體驗報告。
     """
     book = RecipientBook(
         [
@@ -2496,32 +2494,33 @@ def test_trial_email_send_report_button_disabled_when_used_days_below_total(
                 name="測試",
                 phone=None,
                 device="體驗機",
-                borrow_date="2026-07-29",
+                borrow_date="2026-07-20",
                 match_status="ok",
                 days="14",
-                used_days="3",
+                used_days="",
                 business="王小明",
                 trial_status="🟢 體驗中",
             ),
         ],
     )
-    app = make_app(tmp_path, RecordingSender(), recipient_source=lambda: book)
 
-    text = app.route("GET", "/trial-email").text
+    text = templates.render_trial_email(book, today=date(2026, 7, 25))
 
     match = re.search(r'<button type="submit" class="send-report-btn"[^>]*>', text)
     assert match is not None
     assert "disabled" in match.group()
 
 
-def test_trial_email_send_report_button_handles_real_world_day_formats(
-    tmp_path: Path,
-) -> None:
-    """整合案例：線上實際資料格式（帶「天」字、空字串）都要能正確解析、不能讓渲染整頁失敗。
+def test_trial_email_send_report_button_handles_real_world_day_formats() -> None:
+    """整合案例：線上實際資料格式（days 帶「天」字、borrow_date 格式壞掉）都要能
+    正確解析、不能讓渲染整頁失敗。
 
-    producer 從 AIHCR innerText 原樣帶下來的天數欄位格式不保證乾淨（使用者截圖顯示
-    實際格式是「14 天」而非「14」），單元測試裡其他既有案例用的都是乾淨數字字串，
-    這裡補上真實格式與完全解析不出數字（空字串）兩種情況的健壯性驗證。
+    producer 從 AIHCR innerText 原樣帶下來的 ``days`` 欄位格式不保證乾淨（使用者
+    截圖顯示實際格式是「14 天」而非「14」），第一筆驗證 ``_parse_trial_day_count``
+    吃得下帶「天」字的 total、且 borrow_date 配合注入的 today 剛好達標。第二筆的
+    ``borrow_date`` 本身格式壞掉（不是合法日期），驗證 ``_compute_used_days``
+    解析失敗時保守擋下（不可點）——這是已用天數改用接機日動態算之後，還在生效的
+    解析健壯性路徑。
     """
     book = RecipientBook(
         [
@@ -2530,10 +2529,10 @@ def test_trial_email_send_report_button_handles_real_world_day_formats(
                 name="陳筱琪",
                 phone=None,
                 device="體驗機A",
-                borrow_date="2026-07-29",
+                borrow_date="2026-07-20",
                 match_status="ok",
                 days="14 天",
-                used_days="14 天",
+                used_days="",
                 business="王小明",
                 trial_status="🟢 體驗中",
             ),
@@ -2542,7 +2541,7 @@ def test_trial_email_send_report_button_handles_real_world_day_formats(
                 name="李小華",
                 phone=None,
                 device="體驗機B",
-                borrow_date="2026-07-20",
+                borrow_date="不是日期",
                 match_status="ok",
                 days="14",
                 used_days="",
@@ -2551,21 +2550,102 @@ def test_trial_email_send_report_button_handles_real_world_day_formats(
             ),
         ],
     )
-    app = make_app(tmp_path, RecordingSender(), recipient_source=lambda: book)
 
-    response = app.route("GET", "/trial-email")
+    text = templates.render_trial_email(book, today=date(2026, 8, 3))
 
     # 不能因為格式怪異就讓整頁渲染失敗（500 或例外）。
-    assert response.status == HTTPStatus.OK
-    text = response.text
     assert "寄送體驗報告" in text
 
     buttons = re.findall(r'<button type="submit" class="send-report-btn"[^>]*>', text)
     assert len(buttons) == 2
-    # 第一筆「14 天」/「14 天」解析成功且已達標 → 可點。
+    # 第一筆「14 天」total 解析成功，borrow_date 2026-07-20 配合 today 2026-08-03
+    # 剛好滿 14 天 → 可點。
     assert "disabled" not in buttons[0]
-    # 第二筆 used_days 為空字串、解析不出數字 → 保守預設不可點。
+    # 第二筆 borrow_date 格式壞掉，_compute_used_days 回 None → 保守預設不可點。
     assert "disabled" in buttons[1]
+
+
+def test_trial_email_used_days_column_computed_from_borrow_date_not_snapshot() -> None:
+    """已用天 = 今天－接機日動態算，不是 producer 快照裡的 used_days 字串。
+
+    Happy path：borrow_date=2026-07-20、注入 today=2026-08-03，剛好滿 14 天。
+    ``used_days`` 欄位刻意留一個明顯錯誤的舊快照值（"999"），證明「已用天」欄顯示
+    的是算出來的 "14 天" 而不是快照殘留的舊值 —— 這正是本次改動要解決的問題：
+    producer 快照只在重新跑一次時才更新，兩次同步之間會凍結在舊數字。
+    """
+    book = RecipientBook(
+        [
+            Recipient(
+                id="u1",
+                name="測試",
+                phone=None,
+                device="體驗機",
+                borrow_date="2026-07-20",
+                match_status="ok",
+                days="14",
+                used_days="999",  # 明顯過時的快照殘留值，不該被顯示出來
+                business="王小明",
+                trial_status="🟢 體驗中",
+            ),
+        ],
+    )
+
+    text = templates.render_trial_email(book, today=date(2026, 8, 3))
+
+    assert "14 天" in text
+    assert "999" not in text
+    match = re.search(r'<button type="submit" class="send-report-btn"[^>]*>', text)
+    assert match is not None
+    assert "disabled" not in match.group()
+
+
+def test_trial_email_used_days_shows_undetermined_when_borrow_date_unparseable() -> None:
+    """Edge case：``borrow_date`` 格式壞掉 → 「已用天」欄顯示「無法判斷」、按鈕維持 disabled，
+    且整頁渲染不能因此 500／拋例外。
+
+    先驗證 :func:`web.templates._compute_used_days` 本身對壞格式回 ``None``，
+    再驗證整頁渲染的行為一致。
+    """
+    assert templates._compute_used_days("not-a-date") is None
+
+    book = RecipientBook(
+        [
+            Recipient(
+                id="u1",
+                name="測試",
+                phone=None,
+                device="體驗機",
+                borrow_date="not-a-date",
+                match_status="ok",
+                days="14",
+                used_days="",
+                business="王小明",
+                trial_status="🟢 體驗中",
+            ),
+        ],
+    )
+
+    text = templates.render_trial_email(book, today=date(2026, 8, 3))
+
+    assert "無法判斷" in text
+    match = re.search(r'<button type="submit" class="send-report-btn"[^>]*>', text)
+    assert match is not None
+    assert "disabled" in match.group()
+
+
+def test_compute_used_days_clamps_future_borrow_date_to_zero_not_negative() -> None:
+    """回歸鎖：接機日在「今天」之後（producer 髒資料的可能情況）回傳 ``0``，不回負數。
+
+    這是刻意保留的行為（見 code review 討論）：``0`` 天在邏輯上仍然安全 ——
+    必然小於任何合理的總天數，不會讓按鈕誤解鎖；代價是呼叫端無法從回傳值本身
+    分辨「剛接機、0 天」與「接機日資料異常」，但這個決定不影響安全性。這支測試
+    的存在意義是讓這個決定變成「有意識保留、且被測試鎖住」，而不是沒人測過的
+    偶然行為 —— 未來有人想改成回傳 ``None`` 時，這裡會先轉紅提醒。
+    """
+    # 接機日比 today 晚 5 天 → 沒有負數的「已用 -5 天」，回傳 0。
+    assert templates._compute_used_days("2026-08-08", today=date(2026, 8, 3)) == 0
+    # 接機日等於 today → 剛接機當天，也是 0（與上面同一條 clamp 邏輯，非特例）。
+    assert templates._compute_used_days("2026-08-03", today=date(2026, 8, 3)) == 0
 
 
 # --------------------------------------------------------------------------- #
@@ -2871,6 +2951,14 @@ def test_send_trial_report_route_revalidates_days_even_if_frontend_disabled_was_
     證明「伺服器端會自己重算」而不是「假 sender 剛好回傳失敗」。已用天數 < 天數
     這條分支在真正碰觸 DB **之前**就會被擋下，所以這裡不會真的連線 acfh_api，
     只把稽核檔位置導去 tmp_path，避免污染 repo 的 logs/ 目錄。
+
+    這條路徑（``app.route`` 直接呼叫真正的 ``send_trial_report``）不像
+    :func:`web.templates.render_trial_email` 或 ``send_trial_report`` 本身可以
+    注入 ``today``——``web.server`` 的呼叫端刻意不傳這個參數（見改動說明），一律
+    用伺服器真實日期。所以這裡改用「接機日＝今天」（用跟 ``_compute_used_days``
+    伺服器端 fallback 完全相同的 ``ZoneInfo("Asia/Taipei")`` 運算式構造），已用天數
+    會是 0（在極端情況下最多 1，仍遠小於 14 天），不論測試在哪一天執行都保證
+    「尚未達標」，不依賴任何特定的 wall-clock 日期值。
     """
     monkeypatch.setenv(
         "MITAKE_WEB_TRIAL_AUDIT_PATH", str(tmp_path / "trial-report-audit.jsonl")
@@ -2882,10 +2970,12 @@ def test_send_trial_report_route_revalidates_days_even_if_frontend_disabled_was_
                 name="陳筱琪",
                 phone="0912345678",
                 device="體驗機",
-                borrow_date="2026-07-01",
+                # 接機日＝今天：已用天數必定是 0，恆小於 14 天，不依賴測試執行當下
+                # 的具體日期值（同 _compute_used_days 的伺服器端預設計算方式）。
+                borrow_date=datetime.now(ZoneInfo("Asia/Taipei")).date().isoformat(),
                 match_status="ok",
                 days="14",
-                used_days="3",  # 尚未達標：devtools 拿掉 disabled 也不該真的寄出去
+                used_days="3",  # 已不影響驗證邏輯，僅留作展示欄位的既有寫法
                 business="王小明",
                 trial_status="🟢 體驗中",
             ),

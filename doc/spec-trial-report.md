@@ -36,8 +36,12 @@ PM2.5/CO2/VOC/溫濕度 telemetry → 沿用 `aihcr-daily` repo 既有的統計/
 
 1. 用 recipient id 反查 `RecipientBook`；查無此人或 `match_status != "ok"` →
    400，不執行、不查資料庫。
-2. **伺服器端自己重算**「已用天數 ≥ 天數」（用現有的 `_parse_trial_day_count`
-   同一套邏輯）。未達標 → 400，不執行。**不信任前端按鈕的 disabled 狀態**
+2. **伺服器端自己重算**「已用天數 ≥ 天數」。已用天數改用 `_compute_used_days`
+   （今天－接機日 `borrow_date` 動態算，`today` 可注入固定日期供測試使用），
+   不再信任 producer 快照的 `used_days` 字串——那份快照只在 producer 重新跑
+   一次時才會更新，兩次同步之間會凍結在舊數字（2026-08-03 修正）。天數仍用
+   `_parse_trial_day_count` 讀 producer 快照的 `days` 欄（那是活動設定值，不是
+   日期能推出來的）。未達標 → 400，不執行。**不信任前端按鈕的 disabled 狀態**
    （devtools 可繞過，這點在上一輪 code review 就已提醒）。
 3. 用 recipient id 去掉 `u` 前綴得到 acfh `user_id`，查
    `fetch_user_devices(conn, user_id)`：
