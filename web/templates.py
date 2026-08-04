@@ -175,11 +175,11 @@ table.trials button.send-report-btn[disabled] { color: #9aa1ab; background: #f2f
 # 只讀 phone/recipient_id/body，完全不看 sms-template 這個欄位（見 render_form docstring）。
 MESSAGE_TEMPLATES = [
     {"key": "ship", "label": "出貨通知",
-     "body": "【addwii】您訂購的空氣清淨機已出貨，預計 2–3 個工作天送達，屆時請留意收件。如有問題歡迎與我們聯繫。"},
+     "body": "【addwii加我科技】您訂購的空氣清淨機已出貨，預計 2–3 個工作天送達，屆時請留意收件。如有問題歡迎與我們聯繫。"},
     {"key": "trial_end", "label": "14天體驗結束通知",
-     "body": "【addwii】您的 14 天體驗即將結束，感謝您的試用！如需續購或有任何疑問，歡迎隨時與我們聯繫。"},
+     "body": "【addwii加我科技】您的 14 天體驗即將結束，感謝您的試用！如需續購或有任何疑問，歡迎隨時與我們聯繫。"},
     {"key": "filter", "label": "濾網更換通知",
-     "body": "【addwii】提醒您，您的濾網使用已達建議更換週期，為維持最佳空氣品質，請盡快更換濾網。謝謝！"},
+     "body": "【addwii加我科技】提醒您，您的濾網使用已達建議更換週期，為維持最佳空氣品質，請盡快更換濾網。謝謝！"},
 ]
 
 
