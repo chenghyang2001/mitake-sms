@@ -2653,22 +2653,22 @@ def test_compute_used_days_clamps_future_borrow_date_to_zero_not_negative() -> N
 # --------------------------------------------------------------------------- #
 
 
-def test_form_renders_three_message_template_radios() -> None:
-    """表單頁要出三個共用 name="sms-template" 的 radio，各帶 label 文字與 value。
+def test_form_renders_four_message_template_radios() -> None:
+    """表單頁要出四個共用 name="sms-template" 的 radio，各帶 label 文字與 value。
 
-    三個範本（出貨／體驗結束／濾網更換）是定案需求，數量與文字都鎖住 —— 少一個或
-    改名都代表 MESSAGE_TEMPLATES 被動到，這裡就該轉紅。
+    四個範本（出貨／體驗結束／濾網更換／14天免費體驗）是定案需求，數量與文字都鎖住 ——
+    少一個或改名都代表 MESSAGE_TEMPLATES 被動到，這裡就該轉紅。
     """
     html = templates.render_form(max_segments=5, chars_per_segment=70, script_nonce="n")
 
-    # 三個 radio 共用 name（天然單選互斥），且 fieldset legend 存在。
-    assert html.count('name="sms-template"') == 3
+    # 四個 radio 共用 name（天然單選互斥），且 fieldset legend 存在。
+    assert html.count('name="sms-template"') == 4
     assert "訊息範本（選一個自動帶入，仍可修改）" in html
-    # 三個 label 文字。
-    for label in ("出貨通知", "14天體驗結束通知", "濾網更換通知"):
+    # 四個 label 文字。
+    for label in ("出貨通知", "14天體驗結束通知", "濾網更換通知", "14天免費體驗通知"):
         assert label in html
-    # 三個 value（送出時 radio 的值，純前端用途）。
-    for value in ("ship", "trial_end", "filter"):
+    # 四個 value（送出時 radio 的值，純前端用途）。
+    for value in ("ship", "trial_end", "filter", "free_trial"):
         assert f'value="{value}"' in html
 
 

@@ -170,9 +170,10 @@ table.trials button.send-report-btn[disabled] { color: #9aa1ab; background: #f2f
 """
 
 # 訊息範本的**單一真相來源**。radio 快選與（未來若需要的）測試都從這裡取值，
-# 不各自寫死字串。body 內容是定案文案（addwii 出貨／體驗結束／濾網更換三種通知），
-# 一字不改 —— 改文案只改這一處。key 是送出時 radio 的 value，純前端用途：伺服器端
-# 只讀 phone/recipient_id/body，完全不看 sms-template 這個欄位（見 render_form docstring）。
+# 不各自寫死字串。body 內容是定案文案（addwii 出貨／體驗結束／濾網更換／14天免費體驗
+# 四種通知），一字不改 —— 改文案只改這一處。key 是送出時 radio 的 value，純前端用途：
+# 伺服器端只讀 phone/recipient_id/body，完全不看 sms-template 這個欄位（見 render_form
+# docstring）。
 MESSAGE_TEMPLATES = [
     {"key": "ship", "label": "出貨通知",
      "body": "【addwii加我科技】您訂購的空氣清淨機已出貨，預計 2–3 個工作天送達，屆時請留意收件。如有問題歡迎與我們聯繫。"},
@@ -180,6 +181,8 @@ MESSAGE_TEMPLATES = [
      "body": "【addwii加我科技】您的 14 天體驗即將結束，感謝您的試用！如需續購或有任何疑問，歡迎隨時與我們聯繫。"},
     {"key": "filter", "label": "濾網更換通知",
      "body": "【addwii加我科技】提醒您，您的濾網使用已達建議更換週期，為維持最佳空氣品質，請盡快更換濾網。謝謝！"},
+    {"key": "free_trial", "label": "14天免費體驗通知",
+     "body": "【addwii加我科技】清淨機14天免費體驗：有感再決定，不留用零負擔。名額有限，立即申請: bsms.tw/7XUXPI"},
 ]
 
 
