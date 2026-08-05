@@ -174,9 +174,6 @@ table.trials button.send-report-btn[disabled] { color: #9aa1ab; background: #f2f
 # 四種通知），一字不改 —— 改文案只改這一處。key 是送出時 radio 的 value，純前端用途：
 # 伺服器端只讀 phone/recipient_id/body，完全不看 sms-template 這個欄位（見 render_form
 # docstring）。
-# 例外：free_trial 的 bsms.tw/7XUXPI 短網址後刻意保留一個結尾空白（三竹官方技術支援
-# 要求：簡訊內容不可緊接短網址結束，否則收件人點擊會出現 HTTP 400），編輯這則文案時
-# 不可清除（見 tests/test_web.py 的回歸測試鎖）。
 MESSAGE_TEMPLATES = [
     {"key": "ship", "label": "出貨通知",
      "body": "【addwii加我科技】您訂購的空氣清淨機已出貨，預計 2–3 個工作天送達，屆時請留意收件。如有問題歡迎與我們聯繫。"},
@@ -185,7 +182,7 @@ MESSAGE_TEMPLATES = [
     {"key": "filter", "label": "濾網更換通知",
      "body": "【addwii加我科技】提醒您，您的濾網使用已達建議更換週期，為維持最佳空氣品質，請盡快更換濾網。謝謝！"},
     {"key": "free_trial", "label": "14天免費體驗通知",
-     "body": "【addwii加我科技】清淨機14天免費體驗：有感再決定，不留用零負擔。名額有限，立即申請: bsms.tw/7XUXPI "},
+     "body": "【addwii加我科技】14天免費體驗，立即申請：https://addwiicleanroom.com/14day-free-trial"},
 ]
 
 
