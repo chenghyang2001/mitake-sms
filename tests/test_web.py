@@ -2672,6 +2672,13 @@ def test_form_renders_four_message_template_radios() -> None:
         assert f'value="{value}"' in html
 
 
+def test_free_trial_template_body_ends_with_space_for_mitake_short_url() -> None:
+    """回歸鎖：短網址後的結尾空白是三竹官方要求（否則收件人點擊出現 HTTP 400），
+    不是打字疏漏或編輯器格式化殘留。拿掉這個空白這裡就該轉紅。"""
+    free_trial = next(t for t in templates.MESSAGE_TEMPLATES if t["key"] == "free_trial")
+    assert free_trial["body"].endswith("bsms.tw/7XUXPI ")
+
+
 def test_template_radios_escape_body_into_data_attribute() -> None:
     """範本 body 進 data-body 屬性前必須過 _e —— 否則哪天改讀外部來源就是屬性注入。
 
