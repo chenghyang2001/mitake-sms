@@ -191,7 +191,7 @@ importable/testable without those third-party deps installed.
   for a "just call an SMS API" tool; it almost certainly isn't.
 - `doc/session*-summary.md` — chronological log of what changed each session and why.
 - `doc/spec-trial-report.md` — spec for the `/trial-email` "寄送體驗報告" feature (`web/trial_report.py`):
-  boundary conditions, deliberate MVP limitations, and the new env vars it needs on the VPS
-  (`MYSQL_RD2_PASSWORD` / `GMAIL_USER` / `GMAIL_APP_PASSWORD` / `MITAKE_WEB_STAFF_BCC`). As of this
-  writing the VPS deployment step (venv + systemd unit update + env vars) is still pending — code is
-  merged and tested locally, not yet live.
+  boundary conditions, deliberate MVP limitations, and the env vars it needs on the VPS
+  (`MYSQL_RD2_PASSWORD` / `GMAIL_USER` / `GMAIL_APP_PASSWORD` / `MITAKE_WEB_STAFF_BCC`). Deployed and
+  verified live on the VPS since session 7 (`/home/claude/mitake-sms-venv`, see
+  `deploy/mitake-web.service`) — do not assume this feature is still pending.

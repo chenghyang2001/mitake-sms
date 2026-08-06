@@ -79,7 +79,7 @@ python3.12 -c "import mitake; print('餘額點數:', mitake.query_balance())"
 ## 4. VPS 環境鐵律（n8n2vps-hub tab 的既有經驗）
 
 - **一律用 `python3.12` 直接路徑**：`/usr/bin/python3`（symlink）會被未知機制 SIGKILL。systemd `ExecStart` 同樣。
-- VPS 系統時區是 **UTC**（crontab、journalctl 都是 UTC）；n8n2vps-hub 的 APScheduler 讀 config 用 **Asia/Taipei**。先分清楚跑在哪一層再寫時間。
+- VPS 系統時區是 **UTC**（crontab、journalctl 都是 UTC）；n8n2vps-hub 的 APScheduler 讀 config 用 **Asia/Taipei**。先分清楚跑在哪一層再寫時間。**同一份程式碼裡「現在」可能有兩種語意**：絕對時刻（稽核時間戳、rate limiter）用既有的 `datetime.now(timezone.utc).astimezone()` 沒問題；但比對「台灣業務曆日」（如借出天數）必須用 `datetime.now(ZoneInfo("Asia/Taipei")).date()`，套錯會在台灣時間 00:00–08:00 產生 8 小時偏移的隱性 bug（session9 教訓，見 `web/templates.py::_compute_used_days`）。
 - Gmail App Password **含空格**：寫進 env 檔或 SMTP login 前必須去空格（`/etc/mitake-sms.env` 內已是去空格版本）。
 - VPS 的 git credential store 是**唯讀 PAT**：push 需另外帶寫入 token（embedded URL 用完即清），或改在本機 push。
 
@@ -184,6 +184,8 @@ sudo cat /var/log/mitake-sms/send-audit.jsonl | tail -5   # 號碼已遮罩、�
 # 改完程式後重新部署
 cd ~/mitake-sms && git pull
 sudo cp deploy/mitake-web.service /etc/systemd/system/ && sudo systemctl daemon-reload
+# requirements.txt 有變動才需要（session9 新增 tzdata 時踩過，忘記這步會讓服務因 ImportError 起不來）：
+# /home/claude/mitake-sms-venv/bin/pip install -r requirements.txt
 sudo systemctl restart mitake-web
 ```
 
